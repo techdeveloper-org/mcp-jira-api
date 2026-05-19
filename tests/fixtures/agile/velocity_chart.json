@@ -1,0 +1,21 @@
+{
+  "sprints": [
+    {"id": 8, "name": "Sprint 8"},
+    {"id": 9, "name": "Sprint 9"},
+    {"id": 10, "name": "Sprint 10"}
+  ],
+  "velocityStatEntries": {
+    "8": {
+      "estimated": {"value": 25, "text": "25"},
+      "completed": {"value": 22, "text": "22"}
+    },
+    "9": {
+      "estimated": {"value": 30, "text": "30"},
+      "completed": {"value": 28, "text": "28"}
+    },
+    "10": {
+      "estimated": {"value": 21, "text": "21"},
+      "completed": {"value": 18, "text": "18"}
+    }
+  }
+}

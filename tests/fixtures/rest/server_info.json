@@ -1,0 +1,11 @@
+{
+  "baseUrl": "https://test.atlassian.net",
+  "version": "9.0.0",
+  "versionNumbers": [9, 0, 0],
+  "deploymentType": "Cloud",
+  "buildNumber": 90001,
+  "buildDate": "2026-01-01T00:00:00.000Z",
+  "serverTime": "2026-05-18T00:00:00.000Z",
+  "scmInfo": "abc123",
+  "serverTitle": "Test Jira Cloud"
+}

@@ -1,0 +1,77 @@
+{
+  "maxResults": 50,
+  "startAt": 0,
+  "total": 5,
+  "issues": [
+    {
+      "id": "10001",
+      "key": "DEMO-101",
+      "fields": {
+        "summary": "Implement login page",
+        "status": {"name": "Done", "statusCategory": {"key": "done"}},
+        "assignee": {"displayName": "Alice", "accountId": "aaa111"},
+        "priority": {"name": "High"},
+        "issuetype": {"name": "Story"},
+        "labels": [],
+        "customfield_10016": 5,
+        "created": "2026-01-19T08:00:00.000Z"
+      }
+    },
+    {
+      "id": "10002",
+      "key": "DEMO-102",
+      "fields": {
+        "summary": "Implement dashboard",
+        "status": {"name": "In Progress", "statusCategory": {"key": "indeterminate"}},
+        "assignee": {"displayName": "Bob", "accountId": "bbb222"},
+        "priority": {"name": "High"},
+        "issuetype": {"name": "Story"},
+        "labels": [],
+        "customfield_10016": 8,
+        "created": "2026-01-19T08:00:00.000Z"
+      }
+    },
+    {
+      "id": "10003",
+      "key": "DEMO-103",
+      "fields": {
+        "summary": "Fix login redirect bug",
+        "status": {"name": "To Do", "statusCategory": {"key": "new"}},
+        "assignee": {"displayName": "Alice", "accountId": "aaa111"},
+        "priority": {"name": "Medium"},
+        "issuetype": {"name": "Bug"},
+        "labels": ["impediment"],
+        "customfield_10016": 3,
+        "created": "2026-01-21T08:00:00.000Z"
+      }
+    },
+    {
+      "id": "10004",
+      "key": "DEMO-104",
+      "fields": {
+        "summary": "Write unit tests for auth",
+        "status": {"name": "Done", "statusCategory": {"key": "done"}},
+        "assignee": {"displayName": "Charlie", "accountId": "ccc333"},
+        "priority": {"name": "Low"},
+        "issuetype": {"name": "Task"},
+        "labels": [],
+        "customfield_10016": null,
+        "created": "2026-01-19T09:00:00.000Z"
+      }
+    },
+    {
+      "id": "10005",
+      "key": "DEMO-105",
+      "fields": {
+        "summary": "Design API contract",
+        "status": {"name": "Done", "statusCategory": {"key": "done"}},
+        "assignee": {"displayName": "Bob", "accountId": "bbb222"},
+        "priority": {"name": "Medium"},
+        "issuetype": {"name": "Story"},
+        "labels": [],
+        "customfield_10016": 13,
+        "created": "2026-01-19T08:30:00.000Z"
+      }
+    }
+  ]
+}

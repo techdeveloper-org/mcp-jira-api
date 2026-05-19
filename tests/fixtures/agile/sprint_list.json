@@ -1,0 +1,37 @@
+{
+  "maxResults": 50,
+  "startAt": 0,
+  "total": 3,
+  "values": [
+    {
+      "id": 10,
+      "self": "https://test.atlassian.net/rest/agile/1.0/sprint/10",
+      "state": "closed",
+      "name": "Sprint 10",
+      "startDate": "2026-01-05T09:00:00.000Z",
+      "endDate": "2026-01-19T09:00:00.000Z",
+      "completeDate": "2026-01-19T17:00:00.000Z",
+      "goal": "Deliver login module"
+    },
+    {
+      "id": 11,
+      "self": "https://test.atlassian.net/rest/agile/1.0/sprint/11",
+      "state": "active",
+      "name": "Sprint 11",
+      "startDate": "2026-01-20T09:00:00.000Z",
+      "endDate": "2026-02-03T09:00:00.000Z",
+      "completeDate": null,
+      "goal": "Deliver dashboard module"
+    },
+    {
+      "id": 12,
+      "self": "https://test.atlassian.net/rest/agile/1.0/sprint/12",
+      "state": "future",
+      "name": "Sprint 12",
+      "startDate": null,
+      "endDate": null,
+      "completeDate": null,
+      "goal": ""
+    }
+  ]
+}

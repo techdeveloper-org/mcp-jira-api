@@ -17,3 +17,11 @@ build/
 *.jsonl
 sessions/
 .qdrant/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Internal orchestration artifacts (not committed)
+docs/context-delivery-plan.md
+docs/architecture-blueprint.md

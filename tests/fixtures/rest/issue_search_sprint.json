@@ -1,0 +1,67 @@
+{
+  "total": 5,
+  "maxResults": 20,
+  "startAt": 0,
+  "issues": [
+    {
+      "id": "10001",
+      "key": "DEMO-101",
+      "fields": {
+        "summary": "Implement login page",
+        "status": {"name": "Done"},
+        "assignee": {"displayName": "Alice"},
+        "priority": {"name": "High"},
+        "issuetype": {"name": "Story"},
+        "created": "2026-01-19T08:00:00.000Z"
+      }
+    },
+    {
+      "id": "10002",
+      "key": "DEMO-102",
+      "fields": {
+        "summary": "Implement dashboard",
+        "status": {"name": "In Progress"},
+        "assignee": {"displayName": "Bob"},
+        "priority": {"name": "High"},
+        "issuetype": {"name": "Story"},
+        "created": "2026-01-19T08:00:00.000Z"
+      }
+    },
+    {
+      "id": "10003",
+      "key": "DEMO-103",
+      "fields": {
+        "summary": "Fix login redirect bug",
+        "status": {"name": "To Do"},
+        "assignee": {"displayName": "Alice"},
+        "priority": {"name": "Medium"},
+        "issuetype": {"name": "Bug"},
+        "created": "2026-01-21T08:00:00.000Z"
+      }
+    },
+    {
+      "id": "10004",
+      "key": "DEMO-104",
+      "fields": {
+        "summary": "Write unit tests",
+        "status": {"name": "Done"},
+        "assignee": {"displayName": "Charlie"},
+        "priority": {"name": "Low"},
+        "issuetype": {"name": "Task"},
+        "created": "2026-01-19T09:00:00.000Z"
+      }
+    },
+    {
+      "id": "10005",
+      "key": "DEMO-105",
+      "fields": {
+        "summary": "Design API contract",
+        "status": {"name": "Done"},
+        "assignee": {"displayName": "Bob"},
+        "priority": {"name": "Medium"},
+        "issuetype": {"name": "Story"},
+        "created": "2026-01-19T08:30:00.000Z"
+      }
+    }
+  ]
+}

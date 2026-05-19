@@ -22,7 +22,9 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 
 ---
 
-## Available Tools
+## Available Tools (25 total: 10 core + 15 Scrum Master)
+
+### Core Jira Tools (10)
 
 - `jira_create_issue` — Create a Jira issue (project, type, summary, description, priority)
 - `jira_get_issue` — Get full issue details by key (PROJ-123)
@@ -35,11 +37,40 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 - `jira_update_issue` — Update issue fields (summary, description, assignee, labels)
 - `jira_health_check` — Verify Jira URL, credentials, and API version
 
+### Scrum Master -- Board & Sprint Infrastructure (5)
+
+- `jira_get_boards` — List Scrum/Kanban boards accessible to the configured user
+- `jira_get_sprints` — List sprints for a board (filter by state: active/future/closed)
+- `jira_create_sprint` — Create a new sprint on a Scrum board
+- `jira_start_sprint` — Start a future sprint (transitions state to active)
+- `jira_close_sprint` — Close (complete) an active sprint
+
+### Scrum Master -- Ceremony Facilitation (5)
+
+- `jira_plan_sprint` — Sprint planning report with capacity and velocity context
+- `jira_daily_standup` — Daily Scrum report for the active sprint
+- `jira_sprint_review` — Sprint Review report with delivered vs. not-delivered breakdown
+- `jira_retrospective` — Sprint Retrospective report with RE score and Tuckman stage
+- `jira_refine_backlog` — Backlog Refinement report with WSJF scoring template
+
+### Scrum Master -- Analytics (5)
+
+- `jira_get_velocity` — Sprint velocity history and NASSCOM AgileX benchmark comparison
+- `jira_get_sprint_metrics` — Comprehensive metrics for a specific sprint (burndown, WIP, health)
+- `jira_track_impediments` — Impediment and blocker tracking with MTTR analysis
+- `jira_team_health` — Team health dashboard across recent sprints (Tuckman + composite score)
+- `jira_monte_carlo_forecast` — Monte Carlo simulation for probabilistic sprint delivery forecast
+
 ---
 
 ## Shared Utilities (in this repo)
 
 - `base/` — Shared MCP infrastructure package (response builder, decorators, persistence, clients)
+- `agile_client.py` — Jira Software Agile REST API client (/rest/agile/1.0/); mirrors
+                       server.py _request() interface; zero dependency on scrum_calculator.py
+- `scrum_calculator.py` — Pure statistical computation for Scrum tools; no network I/O;
+                           stdlib only (random, statistics, math, datetime); all functions
+                           are stateless pure functions; independently testable without mocks
 - `mcp_errors.py` — Structured error response helpers
 - `input_validator.py` — Null-byte strip, length limits, prompt injection detection
 - `rate_limiter.py` — Token bucket rate limiter (enable via ENABLE_RATE_LIMITING=1)
@@ -84,11 +115,31 @@ proc = subprocess.Popen(
 
 ```
 mcp-jira-api/
-+-- server.py          # Main FastMCP server (entry point)
-+-- base/              # Shared base package (response, decorators, persistence, clients)
-+-- mcp_errors.py      # Error helpers
-+-- input_validator.py # Input validation
-+-- rate_limiter.py    # Rate limiting
++-- server.py           # Main FastMCP server (entry point, 25 tools)
++-- agile_client.py     # NEW: Jira Agile REST API client (/rest/agile/1.0/)
++-- scrum_calculator.py # NEW: Pure statistical computation (no network I/O)
++-- base/               # Shared base package (response, decorators, persistence, clients)
++-- mcp_errors.py       # Error helpers
++-- input_validator.py  # Input validation
++-- rate_limiter.py     # Rate limiting
++-- docs/
+|       architecture-blueprint.md   # Internal architecture blueprint
+|       context-delivery-plan.md    # Internal orchestration artifact
+|       jql-library.md              # 25+ JQL queries + Agile API endpoint reference
+|       automation-rules.md         # 5 Jira automation rules with DAG cycle checks
+|       sprint-dashboard.md         # 7 dashboard widget specifications
+|       ceremony-scripts.md         # Facilitator scripts for 5 Scrum ceremonies
++-- tests/
+|       __init__.py
+|       fixtures/
+|           boards_response.json
+|           sprints_response.json
+|           sprint_issues_response.json
+|           velocity_response.json
+|           sprint_detail_response.json
+|       test_agile_client.py
+|       test_scrum_calculator.py
+|       test_tools_integration.py
 +-- requirements.txt
 +-- .gitignore
 +-- README.md
@@ -107,4 +158,4 @@ mcp-jira-api/
 
 ---
 
-**Last Updated:** 2026-03-31
+**Last Updated:** 2026-05-18

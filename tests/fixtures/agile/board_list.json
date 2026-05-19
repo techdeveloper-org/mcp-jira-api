@@ -1,0 +1,31 @@
+{
+  "maxResults": 50,
+  "startAt": 0,
+  "total": 2,
+  "values": [
+    {
+      "id": 1,
+      "self": "https://test.atlassian.net/rest/agile/1.0/board/1",
+      "name": "DEMO Sprint Board",
+      "type": "scrum",
+      "location": {
+        "projectKey": "DEMO",
+        "projectName": "Demo Project",
+        "projectTypeKey": "software",
+        "displayName": "Demo Project"
+      }
+    },
+    {
+      "id": 2,
+      "self": "https://test.atlassian.net/rest/agile/1.0/board/2",
+      "name": "TEST Kanban Board",
+      "type": "kanban",
+      "location": {
+        "projectKey": "TEST",
+        "projectName": "Test Project",
+        "projectTypeKey": "software",
+        "displayName": "Test Project"
+      }
+    }
+  ]
+}
