@@ -22,7 +22,7 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 
 ---
 
-## Available Tools (25 total: 10 core + 15 Scrum Master)
+## Available Tools (41 total: 10 core + 15 Scrum Master + 16 Advanced Analytics)
 
 ### Core Jira Tools (10)
 
@@ -60,6 +60,28 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 - `jira_track_impediments` — Impediment and blocker tracking with MTTR analysis
 - `jira_team_health` — Team health dashboard across recent sprints (Tuckman + composite score)
 - `jira_monte_carlo_forecast` — Monte Carlo simulation for probabilistic sprint delivery forecast
+
+### Advanced Analytics -- Team Health & Forecasting (8)
+
+- `jira_spotify_health_check` — Run Spotify Squad Health Check scoring for a team
+- `jira_psychological_safety` — Compute Edmondson Psychological Safety Scale score for a team
+- `jira_cognitive_load` — Compute Team Topology Cognitive Load Index (CLI) for a team's domain portfolio
+- `jira_attrition_forecast` — Forecast cumulative attrition impact on team velocity using exponential model
+- `jira_pert_estimate` — Compute a PERT task estimate (optimistic / most-likely / pessimistic)
+- `jira_scrum_of_scrums` — Compute Scrum of Scrums Brook's Law overhead and optimal team count
+- `jira_ist_capacity` — Compute IST timezone distributed team effective capacity
+- `jira_multi_sprint_holidays` — Forecast India national holidays across consecutive sprint windows
+
+### Advanced Analytics -- Flow Metrics & Governance (8)
+
+- `jira_rate_limit_status` — Return the current rate limiter bucket status (read-only)
+- `jira_burndown_chart` — Fetch sprint burndown data and compute burndown health metrics
+- `jira_cfd_analysis` — Fetch cumulative flow diagram data and apply Little's Law analysis
+- `jira_cycle_time_analysis` — Compute cycle time distribution for issues resolved in a sprint
+- `jira_throughput_forecast` — Forecast future sprint throughput using a Poisson model
+- `jira_automation_analyzer` — Analyze Jira automation rule queue stability and DAG cycle safety
+- `jira_tco_analysis` — Compute Total Cost of Ownership and NPV comparison for Jira licensing tiers
+- `jira_nasscom_mapping` — Map Jira sprint data to NASSCOM AgileX L1-L5 maturity dimensions
 
 ---
 
@@ -115,7 +137,7 @@ proc = subprocess.Popen(
 
 ```
 mcp-jira-api/
-+-- server.py           # Main FastMCP server (entry point, 25 tools)
++-- server.py           # Main FastMCP server (entry point, 41 tools)
 +-- agile_client.py     # NEW: Jira Agile REST API client (/rest/agile/1.0/)
 +-- scrum_calculator.py # NEW: Pure statistical computation (no network I/O)
 +-- base/               # Shared base package (response, decorators, persistence, clients)
@@ -158,4 +180,4 @@ mcp-jira-api/
 
 ---
 
-**Last Updated:** 2026-05-18
+**Last Updated:** 2026-05-28

@@ -34,6 +34,7 @@ Windows-Safe: ASCII only (cp1252 compatible)
 import base64
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -47,7 +48,9 @@ from mcp.server.fastmcp import FastMCP
 from base.decorators import mcp_tool_handler
 
 # Scrum Master extension imports
-from agile_client import _agile_request, _agile_url, _build_agile_auth_header
+from agile_client import _agile_request, _agile_url, _build_agile_auth_header, AgileClient
+from base.response import success, error
+from input_validator import validate_input
 import scrum_calculator
 
 mcp = FastMCP(
@@ -1391,6 +1394,17 @@ def jira_sprint_review(
     from datetime import datetime
     review_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ") + " (UTC)"
 
+    dod_matrix = [
+        [1.0,       3.0,  5.0],
+        [1.0 / 3.0, 1.0,  2.0],
+        [1.0 / 5.0, 0.5,  1.0],
+    ]
+    ahp_result = scrum_calculator.ahp_score(dod_matrix)
+    ahp_dod_criteria = ["functionality", "quality", "completeness"]
+    ahp_weights = ahp_result.get("weights", [])
+    ahp_cr = ahp_result.get("CR", None)
+    ahp_consistent = ahp_result.get("consistent", None)
+
     return {
         "sprint_id": sprint_id,
         "sprint_name": sprint_name,
@@ -1404,6 +1418,13 @@ def jira_sprint_review(
         "dod_compliance_pct": dod_compliance_pct,
         "demo_ready_issues": demo_ready_issues,
         "review_timestamp": review_ts,
+        "ahp_dod_criteria": ahp_dod_criteria,
+        "ahp_weights": ahp_weights,
+        "ahp_CR": ahp_cr,
+        "ahp_consistent": ahp_consistent,
+        "ahp_note": (
+            "Standard 3-criterion DoD matrix. CR < 0.10 confirms consistent weighting."
+        ),
     }
 
 
@@ -1472,6 +1493,8 @@ def jira_retrospective(
     action_items_created = 0
     re_result = {}
     if retrospective_action_project_key:
+        if not re.match(r'^[A-Z][A-Z0-9]{0,9}$', retrospective_action_project_key):
+            return {"error": "retrospective_action_project_key must match ^[A-Z][A-Z0-9]{0,9}$"}
         action_jql = (
             "project = " + retrospective_action_project_key
             + " AND labels = retro-action ORDER BY created DESC"
@@ -1543,6 +1566,8 @@ def jira_refine_backlog(
     cfg = _get_config()
     if not project_key or not project_key.strip():
         raise ValueError("project_key must not be empty")
+    if not re.match(r'^[A-Z][A-Z0-9]{0,9}$', project_key.strip()):
+        raise ValueError("project_key must match ^[A-Z][A-Z0-9]{0,9}$ (e.g. PROJ)")
 
     max_issues = max(1, min(100, max_issues))
 
@@ -1587,6 +1612,11 @@ def jira_refine_backlog(
 
         priority_name = (fields.get("priority") or {}).get("name", "Medium")
 
+        js_val = int(sp) if sp > 0 else 1
+        try:
+            wsjf_val = round(scrum_calculator.wsjf_score(1, 1, 1, js_val), 4)
+        except (ValueError, ZeroDivisionError):
+            wsjf_val = 0.0
         wsjf_stories.append({
             "issue_key": issue.get("key", ""),
             "summary": fields.get("summary", ""),
@@ -1595,13 +1625,16 @@ def jira_refine_backlog(
             "story_points": sp,
             "epic_link": epic_link,
             "has_description": has_description,
+            "wsjf_score": wsjf_val,
             "wsjf_template": {
                 "business_value": "?",
                 "time_criticality": "?",
                 "risk_reduction": "?",
-                "job_size": int(sp) if sp > 0 else "?",
+                "job_size": js_val,
             },
         })
+
+    wsjf_stories.sort(key=lambda x: x.get("wsjf_score", 0.0), reverse=True)
 
     unestimated_ratio = unestimated_count / total_count if total_count > 0 else 0.0
     if unestimated_ratio < 0.2:
@@ -1658,8 +1691,11 @@ def jira_get_velocity(
 
     Returns:
         Dict with keys:
-            board_id, sprints_analyzed, velocity_history, velocity_stats,
-            ewma_last, ewma_alpha.
+            board_id, sprints_analyzed, velocity_history, velocity_stats
+            (includes mean, stdev, min, max, nasscom_benchmark; plus supplemental
+            BCa bootstrap CI keys bca_ci_lower, bca_ci_upper, bca_point_estimate,
+            bca_confidence, bca_B when velocity data is available), ewma_last,
+            ewma_alpha.
     """
     cfg = _get_config()
     num_sprints = max(1, min(20, num_sprints))
@@ -1730,6 +1766,21 @@ def jira_get_velocity(
 
     vstats = scrum_calculator.velocity_stats(velocity_points) if velocity_points else {}
 
+    if velocity_points:
+        bca_result = scrum_calculator.bootstrap_bca_ci(
+            [float(v) for v in velocity_points],
+            confidence=0.95,
+            B=1000,
+        )
+        if "error" not in bca_result:
+            vstats["bca_ci_lower"] = bca_result["lower"]
+            vstats["bca_ci_upper"] = bca_result["upper"]
+            vstats["bca_point_estimate"] = bca_result["point_estimate"]
+            vstats["bca_confidence"] = bca_result["confidence"]
+            vstats["bca_B"] = bca_result["B"]
+        else:
+            vstats["bca_note"] = bca_result.get("note", bca_result.get("error", "BCa skipped"))
+
     ewma_alpha = 0.3
     ewma_last = 0.0
     if velocity_points:
@@ -1764,10 +1815,15 @@ def jira_get_sprint_metrics(
         sprint_id: Numeric sprint ID.
 
     Returns:
-        Dict with keys:
-            sprint_id, board_id, burndown_deviation_pct, scope_change_pct,
-            cycle_time_p85_days, wip_current, throughput_per_day,
-            sprint_health, health_reason.
+        Dict with keys (among others):
+            sprint_id, board_id, sprint_name, state,
+            total_issues, done_issues, in_progress_issues, todo_issues,
+            story_points_total, story_points_done, projected_completion_pct,
+            burndown_deviation_pct, scope_change_pct,
+            cycle_time_p85_days (proxy: days elapsed / done issues, not lognormal MLE),
+            wip_current, throughput_per_day, sprint_health, health_reason,
+            issue_type_breakdown, days_elapsed, days_remaining,
+            nasscom_agile_x_level.
     """
     cfg = _get_config()
     from datetime import datetime
@@ -1936,6 +1992,8 @@ def jira_track_impediments(
             flow_efficiency_impact_note.
     """
     cfg = _get_config()
+    if not project_key or not re.match(r'^[A-Z][A-Z0-9]{0,9}$', project_key.strip()):
+        raise ValueError("project_key must match ^[A-Z][A-Z0-9]{0,9}$ (e.g. PROJ)")
 
     jql = 'project = "' + project_key + '" AND labels = "impediment"'
     if sprint_id is not None:
@@ -2048,11 +2106,28 @@ def jira_team_health(
         second_half_mean = sum(velocity_points[half:]) / (len(velocity_points) - half)
         velocity_trend = second_half_mean - first_half_mean
 
-    tuckman_stage = scrum_calculator.tuckman_estimate(
-        velocity_cv=cv_val,
-        velocity_trend=velocity_trend,
-        team_age_sprints=len(velocity_points),
-    )
+    tuckman_meta = {}
+    if len(velocity_points) >= 2:
+        markov_result = scrum_calculator.tuckman_markov(velocity_points)
+        if "error" not in markov_result:
+            tuckman_stage = markov_result["current_stage"]
+            tuckman_meta = {
+                "tuckman_stage_probabilities": markov_result["stage_probabilities"],
+                "tuckman_nasscom_level": markov_result["nasscom_agile_x_level"],
+                "tuckman_empirical_caveat": markov_result["empirical_caveat"],
+            }
+        else:
+            tuckman_stage = scrum_calculator.tuckman_estimate(
+                velocity_cv=cv_val,
+                velocity_trend=velocity_trend,
+                team_age_sprints=len(velocity_points),
+            )
+    else:
+        tuckman_stage = scrum_calculator.tuckman_estimate(
+            velocity_cv=cv_val,
+            velocity_trend=velocity_trend,
+            team_age_sprints=len(velocity_points),
+        )
 
     agile_x = vstats.get("nasscom_agileX_level", "L1")
 
@@ -2069,7 +2144,7 @@ def jira_team_health(
         health_summary = "Critical -- team still forming or restructuring"
         intervention = "Use capacity-based planning; skip velocity-based forecasting"
 
-    return {
+    result = {
         "board_id": board_id,
         "sprints_analyzed": len(velocity_points),
         "tuckman_stage": tuckman_stage,
@@ -2082,6 +2157,8 @@ def jira_team_health(
         "health_summary": health_summary,
         "recommended_intervention": intervention,
     }
+    result.update(tuckman_meta)
+    return result
 
 
 @mcp.tool()
@@ -2119,6 +2196,7 @@ def jira_monte_carlo_forecast(
         raise ValueError("remaining_story_points must be >= 1")
 
     num_velocity_samples = max(2, min(20, num_velocity_samples))
+    iterations = max(1, min(100000, iterations))
 
     velocity_points = []
     try:
@@ -2195,6 +2273,1070 @@ def jira_monte_carlo_forecast(
             "India IT teams: account for 18-25% annual attrition and national holidays in sprint capacity."
         ),
         "iterations": iterations,
+    }
+
+# ---------------------------------------------------------------------------
+# Phase B.1 New Tools: Scrum Master Knowledge Graph Extensions (9 tools)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_spotify_health_check(
+    board_id: int,
+    dimension_scores: str,
+    prev_dimension_scores: Optional[str] = None,
+) -> dict:
+    """Run Spotify Squad Health Check scoring for a team.
+
+    Computes THS (Team Health Score) across 11 standard dimensions using
+    uniform weights. Optionally computes Wilcoxon signed-rank Z statistic
+    for quarter-on-quarter delta if prev_dimension_scores is provided.
+
+    11 required dimensions (keys in dimension_scores JSON):
+      easy_to_release, suitable_process, tech_quality, value, speed,
+      mission, fun, learning, support, pawns_or_players, team_spirit
+
+    Args:
+        board_id: Jira board ID for context (used for audit trail, not for data fetch).
+        dimension_scores: JSON string mapping each of the 11 dimension names to
+            a list of integer scores (0=unhealthy, 1=neutral, 2=healthy).
+            Example: '{"easy_to_release": [1, 2, 1], "suitable_process": [2, 2], ...}'
+        prev_dimension_scores: Optional JSON string mapping dimension names to
+            previous period mean scores (floats) for delta computation.
+            Example: '{"easy_to_release": 1.5, "suitable_process": 2.0, ...}'
+
+    Returns:
+        Dict with keys:
+            THS (float): Team Health Score 0.0-2.0.
+            dimension_scores (Dict[str, float]): Per-dimension mean scores.
+            health_color (str): "Green" (>=1.5), "Amber" (>=0.75), "Red" (<0.75).
+            wilcoxon_Z (float or null): Z statistic if prev provided.
+            delta_vs_previous (float or null): THS delta from previous period.
+    """
+    if not isinstance(board_id, int) or board_id <= 0:
+        raise ValueError("board_id must be a positive integer")
+    clean_scores = validate_input(dimension_scores, max_length=4096, field_name="dimension_scores")
+    scores_dict = json.loads(clean_scores)
+    prev_dict = None
+    if prev_dimension_scores:
+        clean_prev = validate_input(prev_dimension_scores, max_length=4096, field_name="prev_dimension_scores")
+        prev_dict = json.loads(clean_prev)
+    result = scrum_calculator.spotify_health_check(scores_dict, prev_scores=prev_dict)
+    if "error" in result:
+        return {"success": False, "error": result["error"], "error_type": "COMPUTATION_ERROR"}
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_psychological_safety(
+    board_id: int,
+    item_scores: str,
+) -> dict:
+    """Compute Edmondson Psychological Safety Scale score for a team.
+
+    Applies reverse-coding to items at positions 0, 2, 4 (0-indexed) per
+    Edmondson (1999). Returns a PS score in range 1.0-7.0.
+
+    Args:
+        board_id: Jira board ID for context (not used for data fetch).
+        item_scores: JSON array of exactly 7 integers, each in [1, 7].
+            Example: '[3, 5, 2, 6, 4, 5, 3]'
+            Items at positions 0, 2, 4 are reverse-coded (8 - score).
+
+    Returns:
+        Dict with keys:
+            PS_score (float): Mean psychological safety score (1.0-7.0).
+            cronbach_alpha (float): Estimated Cronbach alpha.
+            interpretation (str): "Low" (<3.5), "Moderate" (3.5-5.5), "High" (>5.5).
+            reverse_coded_positions (List[int]): [0, 2, 4].
+    """
+    if not isinstance(board_id, int) or board_id <= 0:
+        raise ValueError("board_id must be a positive integer")
+    clean_scores = validate_input(item_scores, max_length=4096, field_name="item_scores")
+    raw_scores = json.loads(clean_scores)
+    if not isinstance(raw_scores, list):
+        return {"success": False, "error": "item_scores must be a JSON array of 7 integers", "error_type": "VALIDATION_ERROR"}
+    result = scrum_calculator.edmondson_ps_scale(raw_scores)
+    if "error" in result:
+        return {"success": False, "error": result["error"], "error_type": "COMPUTATION_ERROR"}
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_cognitive_load(
+    board_id: int,
+    complexity_json: str,
+    responsibility_json: str,
+    cl_max: float = 10.0,
+) -> dict:
+    """Compute Team Topology Cognitive Load Index (CLI) for a team's domain portfolio.
+
+    CLI = sum(complexity[d] * responsibility[d] for d in common domains) / cl_max
+    overloaded = CLI > 1.0
+
+    Args:
+        board_id: Jira board ID for context (not used for data fetch).
+        complexity_json: JSON object mapping domain name to complexity weight (float >= 0).
+            Example: '{"payments": 3.5, "auth": 2.0, "reporting": 1.5}'
+        responsibility_json: JSON object mapping domain name to responsibility
+            fraction (float >= 0).
+            Example: '{"payments": 0.8, "auth": 1.0, "reporting": 0.5}'
+        cl_max: Maximum cognitive load threshold (default 10.0). Must be > 0.
+
+    Returns:
+        Dict with keys:
+            CL_team (float): Raw cognitive load sum across common domains.
+            CLI (float): Normalized cognitive load index (CL_team / cl_max).
+            overloaded (bool): True if CLI > 1.0.
+            domain_contributions (Dict[str, float]): Per-domain load contribution.
+            cl_max (float): Threshold used.
+            topology_efficiency (Dict[str, float]): Reference mode efficiency factors.
+    """
+    if not isinstance(board_id, int) or board_id <= 0:
+        raise ValueError("board_id must be a positive integer")
+    if cl_max <= 0.0:
+        raise ValueError("cl_max must be > 0")
+    clean_comp = validate_input(complexity_json, max_length=4096, field_name="complexity_json")
+    clean_resp = validate_input(responsibility_json, max_length=4096, field_name="responsibility_json")
+    complexity = json.loads(clean_comp)
+    responsibility = json.loads(clean_resp)
+    result = scrum_calculator.cognitive_load_index(complexity, responsibility, cl_max=cl_max)
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_attrition_forecast(
+    board_id: int,
+    months: float,
+    p_max: float,
+    tau: float = 6.0,
+) -> dict:
+    """Forecast cumulative attrition impact on team velocity using exponential model.
+
+    P(t) = p_max * (1 - exp(-months / tau))
+    effective_velocity_factor = 1 - P(t)
+
+    tau reference values (NASSCOM HR 2024):
+      6 months for experienced hires; 12 months for fresh graduates.
+
+    Args:
+        board_id: Jira board ID for context (not used for data fetch).
+        months: Time elapsed in months (must be > 0).
+        p_max: Maximum asymptotic attrition probability; fraction in (0, 1].
+        tau: Exponential time constant in months (default 6.0, must be > 0).
+
+    Returns:
+        Dict with keys:
+            attrition_probability (float): Cumulative attrition at t=months.
+            months (float): Input time.
+            tau_months (float): Time constant used.
+            p_max (float): Input maximum attrition fraction.
+            effective_velocity_factor (float): Remaining effective velocity fraction.
+            india_context (str): NASSCOM HR 2024 context note.
+    """
+    if not isinstance(board_id, int) or board_id <= 0:
+        raise ValueError("board_id must be a positive integer")
+    result = scrum_calculator.attrition_ramp(months, p_max, tau=tau)
+    if "error" in result:
+        return {"success": False, "error": result["error"], "error_type": "VALIDATION_ERROR"}
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_pert_estimate(
+    optimistic: float,
+    most_likely: float,
+    pessimistic: float,
+) -> dict:
+    """Compute a PERT (Program Evaluation and Review Technique) task estimate.
+
+    mu = (optimistic + 4 * most_likely + pessimistic) / 6
+    sigma = (pessimistic - optimistic) / 6
+    90% CI = mu +/- 1.645 * sigma
+
+    Args:
+        optimistic: Best-case estimate in days (must be <= most_likely).
+        most_likely: Most probable estimate in days.
+        pessimistic: Worst-case estimate in days (must be >= most_likely).
+
+    Returns:
+        Dict with keys:
+            mu_days (float): PERT weighted mean estimate in days.
+            sigma_days (float): PERT standard deviation in days.
+            ci_90_lower (float): 90% CI lower bound in days.
+            ci_90_upper (float): 90% CI upper bound in days.
+            optimistic (float): Input optimistic value.
+            most_likely (float): Input most_likely value.
+            pessimistic (float): Input pessimistic value.
+    """
+    result = scrum_calculator.pert_estimate(optimistic, most_likely, pessimistic)
+    if "error" in result:
+        return {"success": False, "error": result["error"], "error_type": "VALIDATION_ERROR"}
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_scrum_of_scrums(
+    teams: int,
+    productivity_per_team: float,
+    coordination_cost: float,
+) -> dict:
+    """Compute Scrum of Scrums Brook's Law overhead and optimal team count.
+
+    T_n = teams * p - c * teams * (teams - 1) / 2
+    n_optimal = p / c + 0.5
+    overhead_ratio = coordination_overhead / total_raw_capacity
+
+    Args:
+        teams: Number of participating Scrum teams (must be >= 2).
+        productivity_per_team: Baseline sprint velocity per team (must be > 0).
+            Typically in story points per sprint.
+        coordination_cost: Communication overhead cost per team pair per sprint
+            (must be > 0 and < productivity_per_team). Typically in story points.
+
+    Returns:
+        Dict with keys:
+            T_n (float): Net throughput after coordination overhead.
+            n_optimal (float): Team count that maximizes throughput.
+            overhead_ratio (float): Fraction of capacity lost to coordination.
+            teams (int): Input team count.
+            productivity_per_team (float): Input p value.
+            coordination_cost (float): Input c value.
+    """
+    result = scrum_calculator.scrum_of_scrums_overhead(
+        teams, productivity_per_team, coordination_cost
+    )
+    if "error" in result:
+        return {"success": False, "error": result["error"], "error_type": "VALIDATION_ERROR"}
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_ist_capacity(
+    nominal_capacity: float,
+    overlap_hours: float = 4.0,
+) -> dict:
+    """Compute IST timezone distributed team effective capacity.
+
+    Applies a correction factor for the reduced collaboration window when
+    teams span IST (UTC+5:30) and US timezones.
+
+    correction_factor = overlap_hours / 8.0
+    effective_capacity = nominal_capacity * correction_factor
+
+    Args:
+        nominal_capacity: Nominal sprint capacity in story points or hours.
+        overlap_hours: Daily effective collaboration window in hours (default 4.0).
+            Typical US-India overlap: 4 hours/day (9am-1pm IST window).
+
+    Returns:
+        Dict with keys:
+            effective_capacity (float): Adjusted capacity after timezone correction.
+            nominal (float): Input nominal capacity.
+            overlap_hours (float): Overlap hours used.
+            correction_factor (float): overlap_hours / 8.0.
+            q1_seasonal_buffer_factor (float): 1.15 for Q1 Jan-Mar attrition buffer.
+            india_context (str): IST timezone and Q1 context note.
+    """
+    result = scrum_calculator.ist_capacity_correction(nominal_capacity, overlap_hours=overlap_hours)
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_multi_sprint_holidays(
+    sprint_start: str,
+    sprint_duration_days: int = 14,
+    num_sprints: int = 3,
+) -> dict:
+    """Forecast India national holidays across consecutive sprint windows.
+
+    Uses INDIA_NATIONAL_HOLIDAYS_2025_2026 constant from scrum_calculator.py.
+    Dates outside 2025-2026 range will show 0 holidays (no error).
+
+    Args:
+        sprint_start: Sprint 1 start date as ISO string "YYYY-MM-DD".
+        sprint_duration_days: Calendar days per sprint (default 14, must be >= 1).
+        num_sprints: Number of consecutive sprints to analyze (default 3, must be >= 1).
+
+    Returns:
+        Dict with key:
+            sprints (List[Dict]): Per-sprint records, each with:
+                sprint_number (int): 1-based index.
+                start_date (str): Sprint start "YYYY-MM-DD".
+                end_date (str): Sprint end "YYYY-MM-DD" (inclusive).
+                holiday_count (int): India holidays in window.
+                holiday_names (List[str]): Holiday names in window.
+                effective_days (int): sprint_duration_days - holiday_count.
+    """
+    clean_start = validate_input(sprint_start, max_length=20, field_name="sprint_start")
+    result = scrum_calculator.multi_sprint_holiday_forecast(
+        clean_start, sprint_duration_days, num_sprints
+    )
+    if "error" in result:
+        return {"success": False, "error": result["error"], "error_type": "VALIDATION_ERROR"}
+    result["success"] = True
+    return result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_rate_limit_status() -> dict:
+    """Return the current rate limiter bucket status (read-only).
+
+    Reads the internal rate_limiter module state to report on current token
+    counts, capacity, and refill rates for all active buckets. This tool
+    makes NO modifications to rate limiter state.
+
+    Only meaningful when ENABLE_RATE_LIMITING=1 is set in the environment.
+    When rate limiting is disabled, returns a disabled status report.
+
+    Returns:
+        Dict with keys:
+            rate_limiting_enabled (bool): Whether ENABLE_RATE_LIMITING=1 is set.
+            buckets (List[Dict]): Per-bucket status records, each with:
+                client_id (str): Client identifier.
+                bucket_name (str): Bucket name (e.g. "tool_calls").
+                capacity (float): Maximum token capacity.
+                refill_rate_per_sec (float): Tokens added per second.
+                tokens_available (float): Approximate current token count.
+            bucket_count (int): Total number of active buckets.
+    """
+    import rate_limiter as _rl
+
+    enabled = os.environ.get("ENABLE_RATE_LIMITING") == "1"
+
+    buckets_snapshot = []
+    with _rl._buckets_lock:
+        for (client_id, bucket_name), bucket in _rl._buckets.items():
+            with bucket._lock:
+                bucket._refill()
+                buckets_snapshot.append({
+                    "client_id": client_id,
+                    "bucket_name": bucket_name,
+                    "capacity": bucket._capacity,
+                    "refill_rate_per_sec": bucket._refill_rate,
+                    "tokens_available": round(bucket._tokens, 4),
+                })
+
+    return {
+        "success": True,
+        "rate_limiting_enabled": enabled,
+        "buckets": buckets_snapshot,
+        "bucket_count": len(buckets_snapshot),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase B.2 New Tools: Agile Tooling Knowledge Graph Extensions (7 tools)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_burndown_chart(board_id: int, sprint_id: int) -> dict:
+    """Fetch sprint burndown data and compute burndown health metrics.
+
+    Retrieves raw burndown chart data from the Jira Agile rapid charts API
+    and passes it to scrum_calculator.burndown_metrics() to produce ideal
+    vs. actual trend comparison, slope analysis, and sprint health verdict.
+
+    Args:
+        board_id: Numeric Jira board ID (rapid view ID). Must be >= 1.
+        sprint_id: Numeric sprint ID for the burndown period. Must be >= 1.
+
+    Returns:
+        Dict with success=True and keys:
+            board_id (int): Echo of board_id.
+            sprint_id (int): Echo of sprint_id.
+            total_points (float): Total story points at sprint start.
+            burndown_metrics (dict): Output from scrum_calculator.burndown_metrics().
+    """
+    if not isinstance(board_id, int) or board_id < 1:
+        raise ValueError("board_id must be >= 1")
+    if not isinstance(sprint_id, int) or sprint_id < 1:
+        raise ValueError("sprint_id must be >= 1")
+
+    cfg = _get_config()
+    client = AgileClient(cfg)
+
+    raw = client.get_burndown_chart(board_id, sprint_id)
+    if raw is None:
+        return {
+            "success": False,
+            "error": "Jira returned no burndown data for board_id={} sprint_id={}".format(board_id, sprint_id),
+            "error_type": "INVALID_RESPONSE",
+        }
+
+    completed_arr = raw.get("completedPoints") or []
+    incompleted_arr = raw.get("incompletedPoints") or []
+
+    if not completed_arr and not incompleted_arr:
+        return {
+            "success": False,
+            "error": "Burndown response missing completedPoints and incompletedPoints arrays",
+            "error_type": "INVALID_RESPONSE",
+        }
+
+    if incompleted_arr and completed_arr:
+        first_incomplete = incompleted_arr[0] if isinstance(incompleted_arr[0], (int, float)) else 0
+        first_complete = completed_arr[0] if isinstance(completed_arr[0], (int, float)) else 0
+        total_points = float(first_incomplete + first_complete)
+    elif incompleted_arr:
+        first = incompleted_arr[0]
+        total_points = float(first) if isinstance(first, (int, float)) else 0.0
+    else:
+        total_points = float(max(completed_arr)) if completed_arr else 0.0
+
+    if completed_arr and isinstance(completed_arr[0], dict):
+        completed_by_day = [float(entry.get("value", 0)) for entry in completed_arr]
+    else:
+        completed_by_day = [float(v) for v in completed_arr]
+
+    metrics = scrum_calculator.burndown_metrics(total_points, completed_by_day)
+
+    return {
+        "success": True,
+        "board_id": board_id,
+        "sprint_id": sprint_id,
+        "total_points": total_points,
+        "burndown_metrics": metrics,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_cfd_analysis(board_id: int) -> dict:
+    """Fetch cumulative flow diagram data and apply Little's Law analysis.
+
+    Retrieves CFD column data from the Jira Agile rapid charts API and
+    passes arrival/departure streams to scrum_calculator.little_law_analysis()
+    to estimate average WIP, average cycle time, and throughput rate.
+
+    Args:
+        board_id: Numeric Jira board ID (rapid view ID). Must be >= 1.
+
+    Returns:
+        Dict with success=True and keys:
+            board_id (int): Echo of board_id.
+            little_law (dict): Output from scrum_calculator.little_law_analysis().
+    """
+    if not isinstance(board_id, int) or board_id < 1:
+        raise ValueError("board_id must be >= 1")
+
+    cfg = _get_config()
+    client = AgileClient(cfg)
+
+    raw = client.get_cfd(board_id)
+    if raw is None:
+        return {
+            "success": False,
+            "error": "Jira returned no CFD data for board_id={}".format(board_id),
+            "error_type": "INVALID_RESPONSE",
+        }
+
+    column_data = raw.get("columnData") or []
+    if not column_data:
+        return {
+            "success": False,
+            "error": "CFD response missing columnData array",
+            "error_type": "INVALID_RESPONSE",
+        }
+
+    arrivals = []
+    departures = []
+
+    for day_entry in column_data:
+        day_label = day_entry.get("date", "")
+        columns = day_entry.get("columns") or []
+
+        if columns:
+            first_col_count = int(columns[0].get("count", 0)) if columns else 0
+            arrivals.append({"date": day_label, "count": first_col_count})
+
+        done_count = 0
+        for col in columns:
+            col_name = (col.get("name") or col.get("status") or "").lower()
+            if "done" in col_name or "complete" in col_name or "closed" in col_name:
+                done_count = int(col.get("count", 0))
+                break
+        departures.append({"date": day_label, "count": done_count})
+
+    little_law_result = scrum_calculator.little_law_analysis(arrivals, departures)
+
+    return {
+        "success": True,
+        "board_id": board_id,
+        "little_law": little_law_result,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_cycle_time_analysis(board_id: int, sprint_id: int) -> dict:
+    """Compute cycle time distribution for issues resolved in a sprint.
+
+    Fetches sprint issues and individual issue changelogs, computes cycle
+    time in days from created to resolutiondate, then fits a log-normal
+    distribution using scrum_calculator.cycle_time_lognormal_mle().
+
+    Args:
+        board_id: Numeric Jira board ID. Must be >= 1.
+        sprint_id: Numeric sprint ID. Must be >= 1.
+
+    Returns:
+        Dict with success=True and keys:
+            board_id (int): Echo of board_id.
+            sprint_id (int): Echo of sprint_id.
+            lognormal_fit (dict): Output from scrum_calculator.cycle_time_lognormal_mle().
+            per_issue_cycle_times (dict): Mapping of issue_key to cycle_time_days.
+            resolved_count (int): Number of issues with resolved cycle times.
+    """
+    if not isinstance(board_id, int) or board_id < 1:
+        raise ValueError("board_id must be >= 1")
+    if not isinstance(sprint_id, int) or sprint_id < 1:
+        raise ValueError("sprint_id must be >= 1")
+
+    cfg = _get_config()
+    client = AgileClient(cfg)
+
+    sprint_issues_raw = client.get_sprint_issues(
+        sprint_id,
+        fields="summary,status,created,resolutiondate"
+    )
+    if sprint_issues_raw is None:
+        return {
+            "success": False,
+            "error": "No issues found for sprint_id={}".format(sprint_id),
+            "error_type": "INVALID_RESPONSE",
+        }
+
+    issue_list = sprint_issues_raw.get("issues") or []
+
+    cycle_times_dict = {}
+    cycle_time_list = []
+
+    for issue in issue_list:
+        key = issue.get("key", "")
+        fields = issue.get("fields") or {}
+        created_str = fields.get("created") or ""
+        resolution_str = fields.get("resolutiondate") or ""
+
+        if not created_str or not resolution_str:
+            continue
+
+        try:
+            from datetime import datetime as _dt
+            fmt = "%Y-%m-%dT%H:%M:%S.%f%z"
+            try:
+                created_dt = _dt.strptime(created_str[:26] + "+0000", fmt)
+            except ValueError:
+                created_dt = _dt.fromisoformat(created_str[:10])
+            try:
+                resolved_dt = _dt.strptime(resolution_str[:26] + "+0000", fmt)
+            except ValueError:
+                resolved_dt = _dt.fromisoformat(resolution_str[:10])
+
+            if hasattr(created_dt, "date"):
+                delta_days = (resolved_dt.date() - created_dt.date()).days
+            else:
+                delta_days = (resolved_dt - created_dt).days
+
+            if delta_days >= 0:
+                cycle_times_dict[key] = delta_days
+                cycle_time_list.append(float(delta_days))
+        except Exception:
+            continue
+
+    if len(cycle_time_list) < 2:
+        return {
+            "success": False,
+            "error": (
+                "Insufficient resolved issues for cycle time analysis: "
+                "found {} resolved issues, need at least 2".format(len(cycle_time_list))
+            ),
+            "error_type": "INSUFFICIENT_DATA",
+        }
+
+    lognormal_result = scrum_calculator.cycle_time_lognormal_mle(cycle_time_list)
+
+    return {
+        "success": True,
+        "board_id": board_id,
+        "sprint_id": sprint_id,
+        "lognormal_fit": lognormal_result,
+        "per_issue_cycle_times": cycle_times_dict,
+        "resolved_count": len(cycle_time_list),
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_throughput_forecast(
+    board_id: int,
+    num_sprints: int = 5,
+    forecast_periods: int = 3,
+) -> dict:
+    """Forecast future sprint throughput using a Poisson model.
+
+    Fetches closed sprint data from the Jira Agile API, extracts completed
+    issue counts for recent sprints, then applies
+    scrum_calculator.poisson_throughput() to produce a probabilistic
+    delivery forecast over the requested number of future periods.
+
+    Args:
+        board_id: Numeric Jira board ID. Must be >= 1.
+        num_sprints: Number of historical closed sprints to use as input
+                     to the forecast model (default 5). Must be >= 1.
+        forecast_periods: Number of future sprints to forecast (default 3).
+                          Must be >= 1.
+
+    Returns:
+        Dict with success=True and keys:
+            board_id (int): Echo of board_id.
+            historical_sprints (int): Actual number of closed sprints sampled.
+            forecast_periods (int): Echo of forecast_periods.
+            poisson_forecast (dict): Output from scrum_calculator.poisson_throughput().
+    """
+    if not isinstance(board_id, int) or board_id < 1:
+        raise ValueError("board_id must be >= 1")
+    num_sprints = max(1, int(num_sprints))
+    forecast_periods = max(1, int(forecast_periods))
+
+    cfg = _get_config()
+    client = AgileClient(cfg)
+
+    sprints_raw = client.get_sprints(board_id, state="closed", max_results=100)
+    if sprints_raw is None:
+        return {
+            "success": False,
+            "error": "No closed sprints found for board_id={}".format(board_id),
+            "error_type": "INVALID_RESPONSE",
+        }
+
+    sprint_values = sprints_raw.get("values") or sprints_raw.get("sprints") or []
+    recent_sprints = sprint_values[-num_sprints:] if len(sprint_values) >= num_sprints else sprint_values
+
+    completed_per_sprint = []
+    for s in recent_sprints:
+        count = (
+            s.get("completedIssuesCount")
+            or s.get("completedIssues")
+            or s.get("issueCount")
+            or 0
+        )
+        completed_per_sprint.append(int(count))
+
+    if not completed_per_sprint or all(c == 0 for c in completed_per_sprint):
+        return {
+            "success": False,
+            "error": (
+                "Cannot compute throughput forecast: no completed issue counts "
+                "found in closed sprints for board_id={}".format(board_id)
+            ),
+            "error_type": "INSUFFICIENT_DATA",
+        }
+
+    poisson_result = scrum_calculator.poisson_throughput(
+        completed_per_sprint, forecast_periods
+    )
+
+    return {
+        "success": True,
+        "board_id": board_id,
+        "historical_sprints": len(completed_per_sprint),
+        "forecast_periods": forecast_periods,
+        "poisson_forecast": poisson_result,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_automation_analyzer(
+    trigger_rates_json: str,
+    service_rates_json: str,
+    rules_dag_json: str,
+) -> dict:
+    """Analyze Jira automation rule queue stability and DAG cycle safety.
+
+    Applies M/M/1 queueing theory to each automation rule to estimate
+    queue stability, expected queue length, and wait time. Also performs
+    Kahn's topological sort on the rules DAG to detect circular trigger
+    chains that would cause infinite automation loops.
+
+    Args:
+        trigger_rates_json: JSON array of floats representing per-rule
+                            trigger arrival rates (events per minute).
+                            Example: "[2.0, 0.5, 1.2]"
+        service_rates_json: JSON array of floats representing per-rule
+                            service (execution) rates (completions per minute).
+                            Must have the same length as trigger_rates_json.
+                            Example: "[5.0, 3.0, 4.0]"
+        rules_dag_json: JSON object (adjacency list) mapping each rule name
+                        to a list of downstream rule names it triggers.
+                        Example: '{"rule_A": ["rule_B"], "rule_B": [], "rule_C": ["rule_A"]}'
+
+    Returns:
+        Dict with success=True and keys:
+            mm1_analysis (list): Per-rule dicts with fields:
+                rule_index (int), lambda_val (float), mu_val (float),
+                rho_val (float), stable (bool), E_L (float), E_W (float).
+            dag_has_cycle (bool): True if a circular trigger chain was detected.
+            node_count (int): Total number of rules in the DAG.
+    """
+    clean_trigger = validate_input(trigger_rates_json, max_length=4096, field_name="trigger_rates_json")
+    clean_service = validate_input(service_rates_json, max_length=4096, field_name="service_rates_json")
+    clean_dag = validate_input(rules_dag_json, max_length=8192, field_name="rules_dag_json")
+
+    try:
+        trigger_rates = json.loads(clean_trigger)
+    except ValueError as exc:
+        return {"success": False, "error": "Invalid JSON for trigger_rates_json: " + str(exc), "error_type": "VALIDATION_ERROR"}
+
+    try:
+        service_rates = json.loads(clean_service)
+    except ValueError as exc:
+        return {"success": False, "error": "Invalid JSON for service_rates_json: " + str(exc), "error_type": "VALIDATION_ERROR"}
+
+    try:
+        rules_dag = json.loads(clean_dag)
+    except ValueError as exc:
+        return {"success": False, "error": "Invalid JSON for rules_dag_json: " + str(exc), "error_type": "VALIDATION_ERROR"}
+
+    if not isinstance(trigger_rates, list) or not isinstance(service_rates, list):
+        return {"success": False, "error": "trigger_rates_json and service_rates_json must be JSON arrays", "error_type": "VALIDATION_ERROR"}
+
+    if len(trigger_rates) != len(service_rates):
+        return {
+            "success": False,
+            "error": "trigger_rates and service_rates must have equal length; got {} and {}".format(
+                len(trigger_rates), len(service_rates)
+            ),
+            "error_type": "VALIDATION_ERROR",
+        }
+
+    if not isinstance(rules_dag, dict):
+        return {"success": False, "error": "rules_dag_json must be a JSON object (adjacency list)", "error_type": "VALIDATION_ERROR"}
+
+    mm1_analysis = []
+    for i in range(len(trigger_rates)):
+        lambda_val = float(trigger_rates[i])
+        mu_val = float(service_rates[i])
+        if mu_val <= 0:
+            rho_val = float("inf")
+            stable = False
+            e_l = float("inf")
+            e_w = float("inf")
+        else:
+            rho_val = lambda_val / mu_val
+            stable = rho_val < 1.0
+            if stable:
+                e_l = rho_val / (1.0 - rho_val)
+                e_w = 1.0 / (mu_val - lambda_val)
+            else:
+                e_l = float("inf")
+                e_w = float("inf")
+
+        mm1_analysis.append({
+            "rule_index": i,
+            "lambda_val": round(lambda_val, 6),
+            "mu_val": round(mu_val, 6),
+            "rho_val": round(rho_val, 6) if rho_val != float("inf") else "inf",
+            "stable": stable,
+            "E_L": round(e_l, 4) if e_l != float("inf") else "inf",
+            "E_W": round(e_w, 4) if e_w != float("inf") else "inf",
+        })
+
+    in_degree = {}
+    for node in rules_dag:
+        if node not in in_degree:
+            in_degree[node] = 0
+        for neighbor in rules_dag.get(node, []):
+            in_degree[neighbor] = in_degree.get(neighbor, 0) + 1
+
+    queue = [n for n, d in in_degree.items() if d == 0]
+    processed = 0
+    while queue:
+        node = queue.pop(0)
+        processed += 1
+        for neighbor in rules_dag.get(node, []):
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    dag_has_cycle = processed < len(in_degree)
+
+    return {
+        "success": True,
+        "mm1_analysis": mm1_analysis,
+        "dag_has_cycle": dag_has_cycle,
+        "node_count": len(rules_dag),
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_tco_analysis(
+    user_count: int,
+    years: int = 3,
+    discount_rate: float = 0.10,
+) -> dict:
+    """Compute Total Cost of Ownership and NPV comparison for Jira licensing tiers.
+
+    Delegates to scrum_calculator.tco_npv_comparison() which models
+    licensing, infrastructure, and support costs across Jira Cloud Standard,
+    Jira Cloud Premium, and Jira Data Center tiers for the given team size,
+    amortized over the specified time horizon using NPV discounting.
+
+    Args:
+        user_count: Number of Jira users for the TCO calculation. Must be >= 1.
+        years: Time horizon in years for NPV computation (default 3).
+               Must be >= 1.
+        discount_rate: Annual discount rate as a decimal fraction (default 0.10
+                       for 10%). Must be in range (0, 1).
+
+    Returns:
+        Dict with success=True and the full output dict from
+        scrum_calculator.tco_npv_comparison(). Keys include:
+            jira_premium_3yr_npv_inr (float): NPV of Jira Premium total cost (INR).
+            azure_devops_3yr_npv_inr (float): NPV of Azure DevOps total cost (INR).
+            break_even_users (int): User count at which both platforms cost the same.
+            recommendation (str): "Jira Premium" or "Azure DevOps".
+            user_count (int): Input user count echoed back.
+            discount_rate (float): Discount rate used.
+    """
+    if not isinstance(user_count, int) or user_count < 1:
+        raise ValueError("user_count must be >= 1")
+
+    try:
+        years_int = int(years)
+        if years_int < 1:
+            raise ValueError("years must be >= 1")
+    except (TypeError, ValueError) as exc:
+        return {"success": False, "error": "Invalid years value: " + str(exc), "error_type": "VALIDATION_ERROR"}
+
+    try:
+        rate = float(discount_rate)
+        if rate <= 0.0 or rate >= 1.0:
+            raise ValueError("discount_rate must be in range (0, 1)")
+    except (TypeError, ValueError) as exc:
+        return {"success": False, "error": "Invalid discount_rate value: " + str(exc), "error_type": "VALIDATION_ERROR"}
+
+    tco_result = scrum_calculator.tco_npv_comparison(user_count, years_int, rate)
+    tco_result["success"] = True
+    return tco_result
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_nasscom_mapping(board_id: int, sprint_id: int) -> dict:
+    """Map Jira sprint data to NASSCOM AgileX L1-L5 maturity dimensions.
+
+    Fetches sprint issues and velocity history from the Jira Agile API,
+    then evaluates each of the five NASSCOM AgileX maturity dimensions
+    using evidence directly observable from Jira data. Produces a maturity
+    score per dimension and an overall level estimate (L1-L5).
+
+    NASSCOM AgileX dimensions assessed:
+        L1 Initiation: Backlog exists and sprint has issues.
+        L2 Planning: Sprint has a defined goal and issues are estimated.
+        L3 Execution: Velocity variance is consistent (CV <= 0.25).
+        L4 Optimization: Cycle time data is available (issues are resolved).
+        L5 Innovation: Multiple closed sprints with high retrospective
+                       completion rate (proxied from completion ratio).
+
+    Args:
+        board_id: Numeric Jira board ID. Must be >= 1.
+        sprint_id: Numeric sprint ID to evaluate. Must be >= 1.
+
+    Returns:
+        Dict with success=True and keys:
+            board_id (int): Echo of board_id.
+            sprint_id (int): Echo of sprint_id.
+            nasscom_agile_x (dict): Per-dimension maturity evidence and score.
+            overall_level (str): Estimated overall maturity level "L1" through "L5".
+            india_context (str): Note on NASSCOM AgileX applicability in India.
+    """
+    if not isinstance(board_id, int) or board_id < 1:
+        raise ValueError("board_id must be >= 1")
+    if not isinstance(sprint_id, int) or sprint_id < 1:
+        raise ValueError("sprint_id must be >= 1")
+
+    cfg = _get_config()
+    client = AgileClient(cfg)
+
+    sprint_issues_raw = client.get_sprint_issues(
+        sprint_id,
+        fields="summary,status,created,resolutiondate,story_points,customfield_10016,customfield_10028"
+    )
+    if sprint_issues_raw is None:
+        sprint_issues_raw = {}
+
+    issue_list = sprint_issues_raw.get("issues") or []
+
+    sprint_meta_raw = {}
+    try:
+        sprint_meta_raw = client.get_sprint(sprint_id) or {}
+    except Exception:
+        sprint_meta_raw = {}
+
+    sprint_goal = sprint_meta_raw.get("goal") or ""
+
+    velocity_raw = {}
+    velocity_history = []
+    try:
+        velocity_raw = client.get_velocity(board_id) or {}
+    except Exception:
+        velocity_raw = {}
+
+    if velocity_raw:
+        entries = velocity_raw.get("velocityStatEntries") or {}
+        for entry_id in sorted(entries.keys()):
+            entry = entries[entry_id]
+            completed_val = entry.get("completed") or {}
+            points = completed_val.get("value", 0)
+            try:
+                velocity_history.append(int(float(points)))
+            except (TypeError, ValueError):
+                continue
+
+    maturity_scores = {}
+
+    has_issues = len(issue_list) > 0
+    maturity_scores["L1_initiation"] = {
+        "dimension": "Initiation",
+        "evidence": "Sprint has {} issue(s)".format(len(issue_list)),
+        "met": has_issues,
+        "score": 1 if has_issues else 0,
+    }
+
+    estimated_issues = 0
+    for issue in issue_list:
+        fields = issue.get("fields") or {}
+        sp = (
+            fields.get("story_points")
+            or fields.get("customfield_10016")
+            or fields.get("customfield_10028")
+        )
+        if sp is not None:
+            try:
+                if float(sp) > 0:
+                    estimated_issues += 1
+            except (TypeError, ValueError):
+                pass
+
+    has_goal = bool(sprint_goal and sprint_goal.strip())
+    has_estimates = estimated_issues > 0
+    l2_met = has_goal and has_estimates
+    maturity_scores["L2_planning"] = {
+        "dimension": "Planning",
+        "evidence": "goal='{}' | {} issue(s) estimated".format(
+            sprint_goal[:60] if sprint_goal else "", estimated_issues
+        ),
+        "met": l2_met,
+        "score": 2 if l2_met else (1 if has_goal or has_estimates else 0),
+    }
+
+    velocity_cv = None
+    if len(velocity_history) >= 2:
+        import statistics as _stats
+        v_mean = _stats.mean(velocity_history)
+        if v_mean > 0:
+            v_stddev = _stats.pstdev(velocity_history)
+            velocity_cv = v_stddev / v_mean
+        else:
+            velocity_cv = 0.0
+
+    l3_met = velocity_cv is not None and velocity_cv <= 0.25
+    maturity_scores["L3_execution"] = {
+        "dimension": "Execution",
+        "evidence": "velocity CV={} ({} sprints sampled)".format(
+            round(velocity_cv, 4) if velocity_cv is not None else "n/a",
+            len(velocity_history)
+        ),
+        "met": l3_met,
+        "score": 3 if l3_met else (2 if velocity_cv is not None else 1),
+    }
+
+    resolved_count = sum(
+        1 for issue in issue_list
+        if (issue.get("fields") or {}).get("resolutiondate")
+    )
+    l4_met = resolved_count > 0
+    maturity_scores["L4_optimization"] = {
+        "dimension": "Optimization",
+        "evidence": "{} of {} issues resolved (cycle time data available)".format(
+            resolved_count, len(issue_list)
+        ),
+        "met": l4_met,
+        "score": 4 if l4_met else 3,
+    }
+
+    closed_sprint_count = len(velocity_history)
+    total_issue_count = len(issue_list)
+    done_issue_count = sum(
+        1 for issue in issue_list
+        if (((issue.get("fields") or {}).get("status") or {}).get("name") or "").lower()
+        in ("done", "closed", "resolved", "complete")
+    )
+    completion_ratio = (done_issue_count / total_issue_count) if total_issue_count > 0 else 0.0
+    l5_met = closed_sprint_count >= 5 and completion_ratio >= 0.85 and l3_met
+    maturity_scores["L5_innovation"] = {
+        "dimension": "Innovation",
+        "evidence": "{} closed sprints | completion ratio={} | L3 met={}".format(
+            closed_sprint_count, round(completion_ratio, 3), l3_met
+        ),
+        "met": l5_met,
+        "score": 5 if l5_met else (4 if closed_sprint_count >= 5 and l3_met else 3),
+    }
+
+    scores = [
+        maturity_scores["L1_initiation"]["score"],
+        maturity_scores["L2_planning"]["score"],
+        maturity_scores["L3_execution"]["score"],
+        maturity_scores["L4_optimization"]["score"],
+        maturity_scores["L5_innovation"]["score"],
+    ]
+    min_score = min(scores)
+    if min_score >= 5:
+        overall_level = "L5"
+    elif min_score >= 4:
+        overall_level = "L4"
+    elif min_score >= 3:
+        overall_level = "L3"
+    elif min_score >= 2:
+        overall_level = "L2"
+    else:
+        overall_level = "L1"
+
+    india_context = (
+        "NASSCOM AgileX framework is specifically designed for Indian IT/ITES teams. "
+        "L3+ is the industry-average for Tier-1 Indian IT services firms (TCS, Infosys, Wipro). "
+        "L5 corresponds to NASSCOM Digital Transformation Index top-quartile performers. "
+        "Velocity benchmarks: 35-45 SP per 2-week sprint for co-located India teams."
+    )
+
+    return {
+        "success": True,
+        "board_id": board_id,
+        "sprint_id": sprint_id,
+        "nasscom_agile_x": maturity_scores,
+        "overall_level": overall_level,
+        "india_context": india_context,
     }
 
 

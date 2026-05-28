@@ -76,8 +76,12 @@ def mcp_safe_execute(func, error_type="INTERNAL_ERROR", fallback=None):
     try:
         return func()
     except Exception as e:
+        import os
+        details = None
+        if os.environ.get("ENABLE_DEBUG_TRACEBACKS", "").lower() in ("1", "true"):
+            details = {"traceback": traceback.format_exc()[-500:]}
         return mcp_error_response(
             error_type=error_type,
             message=str(e),
-            details={"traceback": traceback.format_exc()[-500:]},
+            details=details,
         )
