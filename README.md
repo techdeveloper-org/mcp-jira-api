@@ -12,31 +12,103 @@ Jira MCP server for [Claude Workflow Engine](https://github.com/techdeveloper-or
 
 - **Jira Cloud support** — REST API v3, ADF-formatted descriptions and comments, email + API token authentication
 - **Jira Server / Data Center support** — REST API v2, plain text bodies, username + password or Personal Access Token (PAT) via Bearer auth
-- **10 MCP tools** covering the full issue lifecycle: create, read, search, transition, comment, update, link PR, list projects, health check
+- **41 MCP tools** across four capability groups: core Jira issue lifecycle (10), Scrum Master board/sprint (5), Scrum ceremonies (5), agile analytics (5), and 16 new KG gap-closure tools
 - **JQL search** — query issues with full Jira Query Language support, configurable field selection and pagination
 - **PR linking** — attach GitHub pull request URLs to Jira issues as remote links
 - **Transition by name** — transition issues using human-readable status names (e.g., "In Progress", "Done") without needing numeric transition IDs
 - **ADF auto-detection** — automatically selects ADF (Cloud v3) or plain text (Server v2) based on `JIRA_API_VERSION`
+- **Agile metrics** — burndown chart analysis (SVI), cumulative flow diagrams (Little's Law), cycle time log-normal MLE (P50/P85/P95), Poisson throughput forecasting
+- **Scrum math** — Bootstrap BCa CI for velocity, AHP pairwise DoD scoring, Tuckman Markov stage classification, PERT estimation, TCO NPV comparison
+- **Team health** — Spotify Squad Health Check (THS + Wilcoxon Z), Edmondson Psychological Safety Scale, cognitive load index, attrition forecast
+- **India layer** — IST timezone capacity correction, multi-sprint national holiday forecasting, NASSCOM AgileX L1-L5 maturity mapping
+- **Security** — all string/integer inputs validated; project keys and issue keys regex-guarded before JQL/URL construction; deps pinned
 - **Stdlib-only HTTP** — uses `urllib.request` exclusively; no `requests` or other runtime dependencies
 - **Windows-safe encoding** — ASCII-only source code, cp1252 compatible for Windows environments
-- **Structured error responses** — Jira API error messages extracted and returned clearly
 
 ---
 
 ## Tool Reference
 
+### Core Jira (10)
+
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
-| `jira_create_issue` | Create a new Jira issue | `project_key` (required), `summary` (required), `issue_type` (default: "Task"), `description`, `priority`, `assignee`, `labels` |
-| `jira_get_issue` | Fetch a single issue by key | `issue_key` (required), `fields` (comma-separated list, optional) |
-| `jira_search_issues` | Search issues using JQL | `jql` (required), `max_results` (default: 20), `start_at` (default: 0), `fields` (optional) |
-| `jira_get_transitions` | List available transitions for an issue | `issue_key` (required) |
-| `jira_transition_issue` | Move an issue to a new status by transition name | `issue_key` (required), `transition_name` (required, e.g., "In Progress"), `comment` (optional) |
-| `jira_add_comment` | Add a comment to an issue | `issue_key` (required), `body` (required) |
-| `jira_link_pr` | Attach a GitHub PR URL as a remote link | `issue_key` (required), `pr_url` (required), `pr_title` (optional), `pr_number` (optional) |
-| `jira_list_projects` | List accessible Jira projects | `max_results` (default: 50), `project_type` (optional, e.g., "software") |
-| `jira_update_issue` | Update fields on an existing issue | `issue_key` (required), `summary`, `description`, `priority`, `assignee`, `labels`, `status_comment` (all optional) |
-| `jira_health_check` | Verify connectivity and credentials | _(no parameters)_ |
+| `jira_create_issue` | Create a new Jira issue | `project_key`, `summary`, `issue_type`, `description`, `priority`, `assignee`, `labels` |
+| `jira_get_issue` | Fetch a single issue by key | `issue_key`, `fields` |
+| `jira_search_issues` | Search issues using JQL | `jql`, `max_results`, `start_at`, `fields` |
+| `jira_get_transitions` | List available transitions for an issue | `issue_key` |
+| `jira_transition_issue` | Move an issue to a new status by name | `issue_key`, `transition_name`, `comment` |
+| `jira_add_comment` | Add a comment to an issue | `issue_key`, `body` |
+| `jira_link_pr` | Attach a GitHub PR URL as a remote link | `issue_key`, `pr_url`, `pr_title`, `pr_number` |
+| `jira_list_projects` | List accessible Jira projects | `max_results`, `project_type` |
+| `jira_update_issue` | Update fields on an existing issue | `issue_key`, `summary`, `description`, `priority`, `assignee`, `labels` |
+| `jira_health_check` | Verify connectivity and credentials | _(none)_ |
+
+### Scrum Master — Board & Sprint Infrastructure (5)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_get_boards` | List Scrum/Kanban boards | `project_key`, `board_type`, `max_results` |
+| `jira_get_sprints` | List sprints for a board | `board_id`, `state` (active/future/closed) |
+| `jira_create_sprint` | Create a new sprint | `board_id`, `name`, `start_date`, `end_date`, `goal` |
+| `jira_start_sprint` | Start a future sprint | `sprint_id`, `board_id` |
+| `jira_close_sprint` | Complete an active sprint | `sprint_id`, `board_id` |
+
+### Scrum Master — Ceremony Facilitation (5)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_plan_sprint` | Sprint planning report with capacity and velocity | `board_id`, `sprint_id` |
+| `jira_daily_standup` | Daily Scrum report for the active sprint | `board_id`, `sprint_id` |
+| `jira_sprint_review` | Sprint Review with AHP-weighted DoD scoring | `board_id`, `sprint_id` |
+| `jira_retrospective` | Retrospective report with RE score and Tuckman stage | `sprint_id`, `board_id` |
+| `jira_refine_backlog` | Backlog refinement with WSJF scoring | `project_key`, `max_issues` |
+
+### Scrum Master — Analytics (5)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_get_velocity` | Sprint velocity history + Bootstrap BCa CI | `board_id`, `num_sprints` |
+| `jira_get_sprint_metrics` | Comprehensive sprint metrics | `board_id`, `sprint_id` |
+| `jira_track_impediments` | Impediment tracking with MTTR | `project_key`, `sprint_id` |
+| `jira_team_health` | Team health dashboard (Tuckman Markov) | `board_id`, `num_sprints` |
+| `jira_monte_carlo_forecast` | Monte Carlo probabilistic delivery forecast | `board_id`, `remaining_story_points`, `iterations` |
+
+### Agile Flow Metrics (4 new)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_burndown_chart` | Sprint burndown analysis: ideal line, SVI, deviation % | `board_id`, `sprint_id` |
+| `jira_cfd_analysis` | Cumulative flow diagram with Little's Law (L=λW) | `board_id` |
+| `jira_cycle_time_analysis` | Per-issue log-normal MLE: P50/P85/P95 cycle times | `board_id`, `sprint_id` |
+| `jira_throughput_forecast` | Poisson throughput model with 95% CI forecast | `board_id`, `num_sprints`, `forecast_periods` |
+
+### Team Health & Safety (4 new)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_spotify_health_check` | Spotify Squad Health Check: THS + Wilcoxon Z delta | `board_id`, `dimension_scores`, `prev_dimension_scores` |
+| `jira_psychological_safety` | Edmondson 7-item PS scale: PS score + interpretation | `board_id`, `item_scores` |
+| `jira_cognitive_load` | Team Topology CLI: overload detection + efficiency | `board_id`, `complexity_json`, `responsibility_json` |
+| `jira_attrition_forecast` | Exponential attrition P(t) with velocity penalty | `board_id`, `months`, `p_max`, `tau` |
+
+### Estimation & Tooling (4 new)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_scrum_of_scrums` | Brooks' Law SoS overhead + optimal team size | `teams`, `productivity_per_team`, `coordination_cost` |
+| `jira_pert_estimate` | PERT weighted mean + 90% CI | `optimistic`, `most_likely`, `pessimistic` |
+| `jira_automation_analyzer` | M/M/1 queueing + Kahn's DAG cycle detection | `trigger_rates_json`, `service_rates_json`, `rules_dag_json` |
+| `jira_tco_analysis` | 3-year TCO NPV: Jira Premium vs Azure DevOps (INR) | `user_count`, `years`, `discount_rate` |
+
+### India Layer (4 new)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_multi_sprint_holidays` | Multi-sprint India national holiday forecasting | `sprint_start`, `sprint_duration_days`, `num_sprints` |
+| `jira_ist_capacity` | IST timezone capacity correction + Q1 buffer | `nominal_capacity`, `overlap_hours` |
+| `jira_nasscom_mapping` | NASSCOM AgileX L1-L5 maturity dimension mapping | `board_id`, `sprint_id` |
+| `jira_rate_limit_status` | Token bucket rate limiter state (read-only) | _(none)_ |
 
 ---
 
@@ -55,10 +127,11 @@ cd mcp-jira-api
 pip install -r requirements.txt
 ```
 
-The server uses Python stdlib for HTTP (`urllib.request`). The primary dependency is the `mcp` package (FastMCP framework):
+The server uses Python stdlib for HTTP (`urllib.request`). The only runtime dependencies are the MCP and FastMCP frameworks, pinned for reproducibility:
 
 ```
-mcp>=1.0.0
+mcp==1.26.0
+fastmcp==3.1.1
 ```
 
 ### 3. Configure in Claude Code
@@ -239,13 +312,20 @@ The server auto-selects ADF or plain text based on `JIRA_API_VERSION`. No code c
 
 ```
 mcp-jira-api/
-+-- server.py           # MCP server entry point (10 tools, FastMCP, urllib.request)
-+-- base/               # Shared base package (MCPResponse, @mcp_tool_handler, AtomicJsonStore)
-|   +-- decorators.py   # @mcp_tool_handler decorator for uniform error handling
-+-- input_validator.py  # Input validation utilities
-+-- mcp_errors.py       # Structured error type definitions
-+-- rate_limiter.py     # Token bucket rate limiter
-+-- requirements.txt    # Runtime dependencies (mcp>=1.0.0)
++-- server.py              # MCP server entry point (41 tools, FastMCP, urllib.request)
++-- scrum_calculator.py    # Pure stdlib math: 24 functions (BCa, AHP, Tuckman, Little's Law, etc.)
++-- agile_client.py        # Jira Agile REST API client (/rest/agile/1.0/)
++-- base/                  # Shared base package (MCPResponse, @mcp_tool_handler, AtomicJsonStore)
+|   +-- decorators.py      # @mcp_tool_handler decorator for uniform error handling
++-- input_validator.py     # Input validation (null-byte strip, length limits, injection detection)
++-- mcp_errors.py          # Structured error type definitions
++-- rate_limiter.py        # Token bucket rate limiter
++-- requirements.txt       # Pinned runtime deps (mcp==1.26.0, fastmcp==3.1.1)
++-- tests/
+|   +-- test_scrum_calculator.py      # Unit tests for original math functions
+|   +-- test_scrum_calculator_new.py  # Unit tests for 16 new math functions (169 tests)
+|   +-- test_tools_integration_new.py # Integration tests for 16 new tools (84 tests)
+|   +-- fixtures/                     # JSON response fixtures for integration tests
 +-- README.md
 ```
 
@@ -269,7 +349,7 @@ This server is one of 13 MCP servers that power the [Claude Workflow Engine](htt
 | [mcp-standards-loader](https://github.com/techdeveloper-org/mcp-standards-loader) | 7 | Standards hot-reload |
 | [mcp-uml-diagram](https://github.com/techdeveloper-org/mcp-uml-diagram) | 15 | UML diagram generation |
 | [mcp-drawio-diagram](https://github.com/techdeveloper-org/mcp-drawio-diagram) | 5 | Draw.io editable diagrams |
-| **mcp-jira-api** | **10** | **Jira issue lifecycle (this repo)** |
+| **mcp-jira-api** | **41** | **Jira issue lifecycle + Agile metrics + Scrum Master (this repo)** |
 | [mcp-jenkins-ci](https://github.com/techdeveloper-org/mcp-jenkins-ci) | 10 | Jenkins CI/CD |
 | [mcp-figma](https://github.com/techdeveloper-org/mcp-figma) | 10 | Figma design-to-code |
 
