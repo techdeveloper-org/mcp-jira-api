@@ -30,7 +30,7 @@ import math
 import random
 import statistics
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 # ---------------------------------------------------------------------------
@@ -1113,9 +1113,8 @@ def edmondson_ps_scale(item_scores):
 
     ps_score = statistics.mean(processed)
 
-    k = 7
     # Single-respondent input: Cronbach alpha requires multiple respondents per item.
-    # With one flat list of k scores, inter-item variance is undefined; return 0.0.
+    # With one flat list of 7 scores, inter-item variance is undefined; return 0.0.
     alpha = 0.0
 
     if ps_score < 3.5:

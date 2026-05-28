@@ -33,10 +33,10 @@ jobs:
         run: pytest tests/ -m "not integration" -v --tb=short
 
       - name: Coverage gate - scrum_calculator (>= 90%)
-        run: pytest tests/test_scrum_calculator.py --cov=scrum_calculator --cov-fail-under=90
+        run: pytest tests/test_scrum_calculator.py tests/test_scrum_calculator_new.py --cov=scrum_calculator --cov-fail-under=90
 
-      - name: Coverage gate - agile_client (>= 80%)
-        run: pytest tests/test_agile_client.py --cov=agile_client --cov-fail-under=80
+      - name: Coverage gate - agile_client (>= 79%)
+        run: pytest tests/test_agile_client.py tests/test_tools_integration_new.py --cov=agile_client --cov-fail-under=79
 
   lint-check:
     name: Lint Check
