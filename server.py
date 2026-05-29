@@ -5,7 +5,7 @@ Supports both Jira Cloud (v3, ADF format) and Jira Server/Data Center (v2, plain
 Backend: urllib.request (stdlib only, no external deps)
 Transport: stdio
 
-Tools (25):
+Tools (52):
   Core Jira (10):
     jira_create_issue, jira_get_issue, jira_search_issues,
     jira_transition_issue, jira_add_comment, jira_link_pr,
@@ -20,6 +20,13 @@ Tools (25):
   Scrum Master -- Analytics (5):
     jira_get_velocity, jira_get_sprint_metrics, jira_track_impediments,
     jira_team_health, jira_monte_carlo_forecast
+  Epic Management (4):
+    jira_create_epic, jira_get_epic, jira_link_to_epic, jira_list_epics
+  Release & Version Management (4):
+    jira_create_version, jira_list_versions, jira_release_version,
+    jira_release_notes
+  Cross-Board / Multi-Team Metrics (3):
+    jira_program_velocity, jira_cross_team_health, jira_dependency_check
 
 Environment Variables:
   JIRA_URL          - Base URL (e.g. https://company.atlassian.net)
@@ -38,7 +45,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 # Ensure src/mcp/ is in path for base package imports
@@ -1282,22 +1289,32 @@ def jira_daily_standup(
 def jira_sprint_review(
     board_id: int,
     sprint_id: int,
+    dod_criteria_weights: Optional[List[List[float]]] = None,
 ) -> dict:
     """Generate a Sprint Review report for the closing sprint.
 
     Provides delivered vs. not-delivered breakdown with story points, velocity
     achieved, velocity statistics, DoD compliance, and NASSCOM AgileX level.
+    When dod_criteria_weights is supplied, computes an AHP-weighted DoD score
+    using the caller-provided pairwise comparison matrix instead of the default.
 
     Args:
         board_id: Numeric board ID.
         sprint_id: Numeric sprint ID (active or recently closed).
+        dod_criteria_weights: Optional n x n pairwise comparison matrix (list of
+            lists of floats) for AHP-weighted DoD scoring. When None (default),
+            uses the built-in 3-criterion DoD matrix (backward compatible).
+            The matrix must be consistent (CR < 0.10); otherwise an error is
+            returned. When provided, dod_weighted_score is added to the result.
 
     Returns:
         Dict with keys:
             sprint_id, sprint_name, sprint_goal, completed_points,
             committed_points, completion_rate, velocity_mean, velocity_cv,
             nasscom_agileX_level, dod_compliance_pct, demo_ready_issues,
-            review_timestamp.
+            review_timestamp, ahp_dod_criteria, ahp_weights, ahp_CR,
+            ahp_consistent, ahp_note. Also dod_weighted_score (float) when
+            dod_criteria_weights is provided.
     """
     cfg = _get_config()
 
@@ -1351,6 +1368,7 @@ def jira_sprint_review(
                         or assignee_raw.get("name")
                         or ""
                     ),
+                    "dod_compliant": all_subtasks_done,
                 })
 
     done_count = sum(
@@ -1394,18 +1412,45 @@ def jira_sprint_review(
     from datetime import datetime
     review_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ") + " (UTC)"
 
-    dod_matrix = [
-        [1.0,       3.0,  5.0],
-        [1.0 / 3.0, 1.0,  2.0],
-        [1.0 / 5.0, 0.5,  1.0],
-    ]
-    ahp_result = scrum_calculator.ahp_score(dod_matrix)
-    ahp_dod_criteria = ["functionality", "quality", "completeness"]
-    ahp_weights = ahp_result.get("weights", [])
-    ahp_cr = ahp_result.get("CR", None)
-    ahp_consistent = ahp_result.get("consistent", None)
+    if dod_criteria_weights is not None:
+        user_ahp = scrum_calculator.ahp_score(dod_criteria_weights)
+        if "error" in user_ahp:
+            return error("AHP matrix error: " + user_ahp["error"])
+        if not user_ahp.get("consistent", False):
+            return error(
+                "AHP matrix inconsistent (CR="
+                + str(round(user_ahp.get("CR", 0.0), 4))
+                + "). CR must be < 0.10. Revise pairwise comparison matrix."
+            )
+        w = user_ahp["weights"]
+        first_weight = w[0] if w else 1.0
+        scored = []
+        for story in demo_ready_issues:
+            binary = 1.0 if story.get("dod_compliant", False) else 0.0
+            scored.append(binary * first_weight)
+        dod_weighted_score = round(
+            sum(scored) / len(scored) if scored else 0.0, 4
+        )
+        ahp_dod_criteria = ["user_criterion_" + str(i + 1) for i in range(user_ahp["n"])]
+        ahp_weights = user_ahp["weights"]
+        ahp_cr = user_ahp["CR"]
+        ahp_consistent = user_ahp["consistent"]
+        ahp_note = "User-provided AHP matrix. CR < 0.10 confirms consistent weighting."
+    else:
+        dod_weighted_score = None
+        dod_matrix = [
+            [1.0,       3.0,  5.0],
+            [1.0 / 3.0, 1.0,  2.0],
+            [1.0 / 5.0, 0.5,  1.0],
+        ]
+        default_ahp = scrum_calculator.ahp_score(dod_matrix)
+        ahp_dod_criteria = ["functionality", "quality", "completeness"]
+        ahp_weights = default_ahp.get("weights", [])
+        ahp_cr = default_ahp.get("CR", None)
+        ahp_consistent = default_ahp.get("consistent", None)
+        ahp_note = "Standard 3-criterion DoD matrix. CR < 0.10 confirms consistent weighting."
 
-    return {
+    result = {
         "sprint_id": sprint_id,
         "sprint_name": sprint_name,
         "sprint_goal": sprint_goal,
@@ -1422,10 +1467,11 @@ def jira_sprint_review(
         "ahp_weights": ahp_weights,
         "ahp_CR": ahp_cr,
         "ahp_consistent": ahp_consistent,
-        "ahp_note": (
-            "Standard 3-criterion DoD matrix. CR < 0.10 confirms consistent weighting."
-        ),
+        "ahp_note": ahp_note,
     }
+    if dod_weighted_score is not None:
+        result["dod_weighted_score"] = dod_weighted_score
+    return result
 
 
 @mcp.tool()
@@ -3337,6 +3383,609 @@ def jira_nasscom_mapping(board_id: int, sprint_id: int) -> dict:
         "nasscom_agile_x": maturity_scores,
         "overall_level": overall_level,
         "india_context": india_context,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Epic Management Tools (4)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_create_epic(
+    project_key: str,
+    name: str,
+    summary: str,
+    start_date: Optional[str] = None,
+    due_date: Optional[str] = None,
+) -> dict:
+    """Create a Jira Epic in the specified project.
+
+    Args:
+        project_key: Jira project key (e.g. PROJ).
+        name: Epic name (short label shown on the epic; Cloud customfield_10014).
+        summary: Epic title/summary displayed as the issue summary.
+        start_date: Optional ISO-8601 start date string (e.g. 2026-06-01).
+        due_date: Optional ISO-8601 due date string (e.g. 2026-09-30).
+
+    Returns:
+        Dict with keys: epic_key, epic_id, summary, name, epic_url.
+    """
+    project_key = validate_input(project_key, field_name="project_key")
+    name = validate_input(name, field_name="name")
+    summary = validate_input(summary, field_name="summary")
+    cfg = _get_config()
+
+    fields = {
+        "project": {"key": project_key},
+        "issuetype": {"name": "Epic"},
+        "summary": summary,
+        "customfield_10014": name,
+    }
+    if due_date:
+        fields["duedate"] = due_date
+    if start_date:
+        fields["customfield_10015"] = start_date
+
+    result = _request(cfg, "POST", "/issue", {"fields": fields})
+    return {
+        "epic_key": result.get("key", ""),
+        "epic_id": result.get("id", ""),
+        "summary": summary,
+        "name": name,
+        "epic_url": cfg["url"] + "/browse/" + result.get("key", ""),
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_get_epic(
+    epic_key: str,
+) -> dict:
+    """Fetch Epic details including linked story count and story point rollup.
+
+    Args:
+        epic_key: Epic issue key (e.g. PROJ-42).
+
+    Returns:
+        Dict with keys: epic_key, summary, status, linked_story_count,
+        story_points_total, done_story_count, completion_pct.
+    """
+    epic_key = validate_input(epic_key, field_name="epic_key")
+    cfg = _get_config()
+
+    safe_epic_key = urllib.request.quote(epic_key, safe="")
+    detail = _request(
+        cfg, "GET",
+        "/issue/" + safe_epic_key + "?fields=summary,status,customfield_10014,customfield_10016"
+    )
+    raw_fields = detail.get("fields", {})
+    status_name = (raw_fields.get("status") or {}).get("name", "")
+    epic_summary = raw_fields.get("summary", "")
+
+    jql_safe_key = epic_key.replace('"', '\\"')
+    jql = '"Epic Link" = "' + jql_safe_key + '" ORDER BY created ASC'
+    if not _is_cloud(cfg):
+        jql = 'cf[10014] = "' + jql_safe_key + '" ORDER BY created ASC'
+    stories_result = _request(
+        cfg, "GET",
+        "/search?jql=" + urllib.request.quote(jql)
+        + "&fields=summary,status,customfield_10016,customfield_10028,story_points"
+        + "&maxResults=100"
+    )
+
+    story_issues = (stories_result or {}).get("issues", [])
+    linked_story_count = len(story_issues)
+    sp_total = 0.0
+    done_count = 0
+    for issue in story_issues:
+        sp = _extract_story_points(issue.get("fields", {}))
+        sp_total += sp
+        st_name = (issue.get("fields", {}).get("status") or {}).get("name", "")
+        if st_name.lower() in ("done", "closed", "resolved"):
+            done_count += 1
+
+    completion_pct = round(
+        (done_count / linked_story_count * 100) if linked_story_count > 0 else 0.0, 1
+    )
+    return {
+        "epic_key": epic_key,
+        "summary": epic_summary,
+        "status": status_name,
+        "linked_story_count": linked_story_count,
+        "story_points_total": round(sp_total, 1),
+        "done_story_count": done_count,
+        "completion_pct": completion_pct,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_link_to_epic(
+    issue_key: str,
+    epic_key: str,
+) -> dict:
+    """Link an existing issue to an Epic by setting the Epic Link field.
+
+    Args:
+        issue_key: Issue key to link (e.g. PROJ-10).
+        epic_key: Target epic key (e.g. PROJ-42).
+
+    Returns:
+        Dict with keys: issue_key, epic_key, linked (bool).
+    """
+    issue_key = validate_input(issue_key, field_name="issue_key")
+    epic_key = validate_input(epic_key, field_name="epic_key")
+    cfg = _get_config()
+
+    _request(
+        cfg, "PUT",
+        "/issue/" + urllib.request.quote(issue_key, safe=""),
+        {"fields": {"customfield_10014": epic_key}}
+    )
+    return {
+        "issue_key": issue_key,
+        "epic_key": epic_key,
+        "linked": True,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_list_epics(
+    board_id: int,
+) -> dict:
+    """List all Epics for a Jira Software board.
+
+    Uses the Agile REST API (/rest/agile/1.0/board/{id}/epic).
+    Works only on Jira Software Scrum/Kanban boards.
+
+    Args:
+        board_id: Numeric board ID.
+
+    Returns:
+        Dict with keys: board_id, epics (list of dicts), total.
+    """
+    cfg = _get_config()
+
+    result = _agile_request(cfg, "GET", "board/" + str(board_id) + "/epic")
+    if result is None:
+        result = {}
+
+    raw_epics = result.get("values", [])
+    epics = [
+        {
+            "key": e.get("key", ""),
+            "summary": e.get("summary", ""),
+            "done": e.get("done", False),
+        }
+        for e in raw_epics
+    ]
+    return {
+        "board_id": board_id,
+        "epics": epics,
+        "total": len(epics),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Release & Version Management Tools (4)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_create_version(
+    project_key: str,
+    name: str,
+    release_date: Optional[str] = None,
+    description: Optional[str] = None,
+) -> dict:
+    """Create a project version (release) in Jira.
+
+    Args:
+        project_key: Jira project key (e.g. PROJ).
+        name: Version name (e.g. v1.2.0).
+        release_date: Optional ISO-8601 release date (e.g. 2026-06-30).
+        description: Optional description of the release.
+
+    Returns:
+        Dict with keys: version_id, name, released, project_key.
+    """
+    project_key = validate_input(project_key, field_name="project_key")
+    name = validate_input(name, field_name="name")
+    cfg = _get_config()
+
+    payload = {
+        "project": project_key,
+        "name": name,
+        "released": False,
+        "archived": False,
+    }
+    if release_date:
+        payload["releaseDate"] = release_date
+    if description:
+        payload["description"] = description
+
+    result = _request(cfg, "POST", "/version", payload)
+    return {
+        "version_id": result.get("id", ""),
+        "name": result.get("name", name),
+        "released": False,
+        "project_key": project_key,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_list_versions(
+    project_key: str,
+) -> dict:
+    """List all versions for a Jira project.
+
+    Args:
+        project_key: Jira project key (e.g. PROJ).
+
+    Returns:
+        Dict with keys: project_key, versions (list), total.
+        Each version has: id, name, released, archived, releaseDate.
+    """
+    project_key = validate_input(project_key, field_name="project_key")
+    cfg = _get_config()
+
+    result = _request(
+        cfg, "GET",
+        "/project/" + urllib.request.quote(project_key, safe="") + "/versions"
+    )
+    if result is None:
+        result = []
+
+    versions = [
+        {
+            "id": v.get("id", ""),
+            "name": v.get("name", ""),
+            "released": v.get("released", False),
+            "archived": v.get("archived", False),
+            "releaseDate": v.get("releaseDate", None),
+        }
+        for v in (result if isinstance(result, list) else [])
+    ]
+    return {
+        "project_key": project_key,
+        "versions": versions,
+        "total": len(versions),
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_release_version(
+    version_id: str,
+    release_date: Optional[str] = None,
+) -> dict:
+    """Mark a Jira project version as released.
+
+    Args:
+        version_id: Numeric version ID (from jira_create_version or jira_list_versions).
+        release_date: Optional ISO-8601 release date. Defaults to today's date.
+
+    Returns:
+        Dict with keys: version_id, released (True), release_date.
+    """
+    version_id = validate_input(version_id, field_name="version_id")
+    cfg = _get_config()
+
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    effective_date = release_date if release_date else today
+
+    _request(
+        cfg, "PUT",
+        "/version/" + urllib.request.quote(version_id, safe=""),
+        {"released": True, "releaseDate": effective_date}
+    )
+    return {
+        "version_id": version_id,
+        "released": True,
+        "release_date": effective_date,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_release_notes(
+    project_key: str,
+    version_name: str,
+) -> dict:
+    """Generate release notes from all issues fixed in a version.
+
+    Fetches issues via JQL fixVersion filter and groups by issue type
+    (Bug, Story, Task, Sub-task, etc.).
+
+    Args:
+        project_key: Jira project key (e.g. PROJ).
+        version_name: Exact version name as it appears in Jira (e.g. v1.2.0).
+
+    Returns:
+        Dict with keys: project_key, version, groups (dict by issue type), total_issues.
+    """
+    project_key = validate_input(project_key, field_name="project_key")
+    version_name = validate_input(version_name, field_name="version_name")
+    cfg = _get_config()
+
+    safe_version = version_name.replace('"', '\\"')
+    safe_project = project_key.replace('"', '\\"')
+    jql = 'project="' + safe_project + '" AND fixVersion="' + safe_version + '" ORDER BY issuetype ASC'
+    path = (
+        "/search?jql=" + urllib.request.quote(jql)
+        + "&fields=summary,issuetype,status&maxResults=100"
+    )
+    result = _request(cfg, "GET", path)
+    if result is None:
+        result = {}
+
+    issues = result.get("issues", [])
+    groups = {}
+    for issue in issues:
+        itype = (issue.get("fields", {}).get("issuetype") or {}).get("name", "Other")
+        entry = {
+            "key": issue.get("key", ""),
+            "summary": (issue.get("fields", {}) or {}).get("summary", ""),
+            "status": ((issue.get("fields", {}).get("status")) or {}).get("name", ""),
+        }
+        groups.setdefault(itype, []).append(entry)
+
+    return {
+        "project_key": project_key,
+        "version": version_name,
+        "groups": groups,
+        "total_issues": len(issues),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-Board / Multi-Team Metrics (3)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_program_velocity(
+    board_ids: List[int],
+    num_sprints: int = 5,
+) -> dict:
+    """Aggregate velocity across multiple Scrum boards for program-level reporting.
+
+    Calls the Agile velocity chart endpoint per board and builds a combined view
+    showing per-team and total program velocity. No native multi-board Jira API exists;
+    this tool loops over board_ids (ADR-5).
+
+    Args:
+        board_ids: List of numeric board IDs to aggregate.
+        num_sprints: Number of recent sprints to include (1-20, default 5).
+
+    Returns:
+        Dict with keys: board_count, num_sprints, per_team (dict keyed by
+        stringified board_id, since JSON object keys are always strings),
+        program_total_avg (float), sprints_sampled.
+    """
+    if not board_ids:
+        return error("board_ids must be a non-empty list")
+    if not 1 <= num_sprints <= 20:
+        return error("num_sprints must be between 1 and 20")
+    cfg = _get_config()
+
+    per_team = {}
+    all_velocities = []
+    for board_id in board_ids:
+        v_data = _agile_request(
+            cfg, "GET",
+            "rapid/charts/velocity?rapidViewId=" + str(board_id)
+        )
+        if v_data is None:
+            v_data = {}
+
+        entries = v_data.get("velocityStatEntries", {})
+        sprint_ids_sorted = sorted(entries.keys(), key=lambda x: int(x))[-num_sprints:]
+        completed = [
+            float(entries[sid].get("completed", {}).get("value", 0))
+            for sid in sprint_ids_sorted
+        ]
+        avg_v = round(sum(completed) / len(completed), 1) if completed else 0.0
+        per_team[str(board_id)] = {
+            "board_id": board_id,
+            "velocity_by_sprint": [round(v, 1) for v in completed],
+            "sprint_count": len(completed),
+            "avg_velocity": avg_v,
+        }
+        all_velocities.extend(completed)
+
+    program_total_avg = round(
+        sum(all_velocities) / len(all_velocities), 1
+    ) if all_velocities else 0.0
+
+    return {
+        "board_count": len(board_ids),
+        "num_sprints": num_sprints,
+        "per_team": per_team,
+        "program_total_avg": program_total_avg,
+        "sprints_sampled": len(all_velocities),
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_cross_team_health(
+    board_ids: List[int],
+) -> dict:
+    """Run team health analysis across multiple boards and return ranked comparison.
+
+    Replicates the jira_team_health logic per board, computes a composite score,
+    and ranks teams. Maximum 10 boards per call to limit API calls (DoS protection).
+
+    Args:
+        board_ids: List of numeric board IDs (max 10).
+
+    Returns:
+        Dict with keys: teams (list ranked by composite_score), top_team_board_id,
+        lowest_team_board_id, board_count.
+    """
+    if not board_ids:
+        return error("board_ids must be a non-empty list")
+    if len(board_ids) > 10:
+        return error("max 10 boards per call to limit Jira API load")
+    cfg = _get_config()
+
+    tuckman_weight_map = {
+        "Performing": 1.0, "Norming": 0.75,
+        "Storming": 0.5, "Forming": 0.25,
+    }
+    agile_x_weight_map = {
+        "L5": 1.0, "L4": 0.8, "L3": 0.6, "L2": 0.4, "L1": 0.2,
+    }
+
+    team_scores = []
+    for board_id in board_ids:
+        velocity_points = []
+        closed = _agile_request(
+            cfg, "GET",
+            "board/" + str(board_id) + "/sprint?state=closed&maxResults=6"
+        )
+        if closed is None:
+            closed = {}
+
+        for s in closed.get("values", []):
+            sid = s.get("id")
+            if sid:
+                si = _agile_request(
+                    cfg, "GET",
+                    "sprint/" + str(sid) + "/issue?maxResults=200&fields=status,customfield_10016,customfield_10028,story_points"
+                )
+                if si:
+                    sp_sum = sum(
+                        _extract_story_points(i.get("fields", {}))
+                        for i in si.get("issues", [])
+                        if (i.get("fields", {}).get("status") or {}).get("name", "").lower()
+                        in ("done", "closed", "resolved")
+                    )
+                    velocity_points.append(int(sp_sum))
+
+        vstats = scrum_calculator.velocity_stats(velocity_points) if velocity_points else {}
+        cv_val = float(vstats.get("cv", 0.5))
+        velocity_trend = 0.0
+        if len(velocity_points) >= 2:
+            half = len(velocity_points) // 2
+            first_mean = sum(velocity_points[:half]) / half
+            second_mean = sum(velocity_points[half:]) / (len(velocity_points) - half)
+            velocity_trend = second_mean - first_mean
+
+        tuckman_stage = scrum_calculator.tuckman_estimate(
+            velocity_cv=cv_val,
+            velocity_trend=velocity_trend,
+            team_age_sprints=len(velocity_points),
+        )
+        agile_x = vstats.get("nasscom_agileX_level", "L1")
+
+        t_w = tuckman_weight_map.get(tuckman_stage, 0.25)
+        a_w = agile_x_weight_map.get(agile_x, 0.2)
+        composite = round((t_w + a_w) / 2.0, 4)
+
+        team_scores.append({
+            "board_id": board_id,
+            "tuckman_stage": tuckman_stage,
+            "velocity_cv": round(cv_val, 4),
+            "nasscom_agileX_level": agile_x,
+            "composite_score": composite,
+            "sprints_analyzed": len(velocity_points),
+        })
+
+    ranked = sorted(team_scores, key=lambda x: x["composite_score"], reverse=True)
+    for idx, team in enumerate(ranked):
+        team["rank"] = idx + 1
+
+    return {
+        "board_count": len(board_ids),
+        "teams": ranked,
+        "top_team_board_id": ranked[0]["board_id"] if ranked else None,
+        "lowest_team_board_id": ranked[-1]["board_id"] if ranked else None,
+    }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def jira_dependency_check(
+    board_ids: List[int],
+) -> dict:
+    """Find cross-board blockers -- issues on one board that block issues on another.
+
+    Fetches active sprint issues per board, maps issue keys to boards, then checks
+    each issue's 'Blocks' outward links for cross-board dependencies.
+
+    Args:
+        board_ids: List of numeric board IDs to check.
+
+    Returns:
+        Dict with keys: cross_board_blockers (list), total_blockers,
+        boards_checked, boards_with_active_sprint.
+    """
+    if not board_ids:
+        return error("board_ids must be a non-empty list")
+    cfg = _get_config()
+
+    board_issue_map = {}
+    boards_with_sprint = 0
+
+    for board_id in board_ids:
+        sprint_result = _agile_request(
+            cfg, "GET",
+            "board/" + str(board_id) + "/sprint?state=active"
+        )
+        if sprint_result is None:
+            sprint_result = {}
+        active_sprints = sprint_result.get("values", [])
+        if not active_sprints:
+            continue
+        boards_with_sprint += 1
+        sprint_id = active_sprints[0].get("id")
+        if not sprint_id:
+            continue
+
+        issues_result = _agile_request(
+            cfg, "GET",
+            "sprint/" + str(sprint_id) + "/issue?maxResults=200&fields=summary,issuelinks"
+        )
+        if issues_result is None:
+            issues_result = {}
+
+        for issue in issues_result.get("issues", []):
+            board_issue_map[issue.get("key", "")] = board_id
+
+    cross_board_blockers = []
+    for issue_key, blocker_board in list(board_issue_map.items()):
+        issue_detail = _request(
+            cfg, "GET",
+            "/issue/" + urllib.request.quote(issue_key, safe="") + "?fields=issuelinks"
+        )
+        if issue_detail is None:
+            continue
+        for link in (issue_detail.get("fields", {}).get("issuelinks") or []):
+            link_type = (link.get("type") or {}).get("name", "")
+            if link_type == "Blocks":
+                out_issue = link.get("outwardIssue") or {}
+                blocked_key = out_issue.get("key", "")
+                if blocked_key and blocked_key in board_issue_map:
+                    blocked_board = board_issue_map[blocked_key]
+                    if blocked_board != blocker_board:
+                        cross_board_blockers.append({
+                            "blocker_key": issue_key,
+                            "blocks_key": blocked_key,
+                            "blocker_board": blocker_board,
+                            "blocked_board": blocked_board,
+                        })
+
+    return {
+        "cross_board_blockers": cross_board_blockers,
+        "total_blockers": len(cross_board_blockers),
+        "boards_checked": len(board_ids),
+        "boards_with_active_sprint": boards_with_sprint,
     }
 
 

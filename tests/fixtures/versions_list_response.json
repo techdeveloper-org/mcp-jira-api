@@ -1,0 +1,1 @@
+[{"id": "10010", "name": "v1.0.0", "released": false, "archived": false, "releaseDate": null, "self": "https://test.atlassian.net/rest/api/3/version/10010"}, {"id": "10009", "name": "v0.9.0", "released": true, "archived": false, "releaseDate": "2026-01-15", "self": "https://test.atlassian.net/rest/api/3/version/10009"}]

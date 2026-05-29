@@ -12,7 +12,7 @@ Jira MCP server for [Claude Workflow Engine](https://github.com/techdeveloper-or
 
 - **Jira Cloud support** — REST API v3, ADF-formatted descriptions and comments, email + API token authentication
 - **Jira Server / Data Center support** — REST API v2, plain text bodies, username + password or Personal Access Token (PAT) via Bearer auth
-- **41 MCP tools** across four capability groups: core Jira issue lifecycle (10), Scrum Master board/sprint (5), Scrum ceremonies (5), agile analytics (5), and 16 new KG gap-closure tools
+- **52 MCP tools**: core Jira issue lifecycle (10), Scrum Master board/sprint (5), Scrum ceremonies (5), agile analytics (5), agile flow metrics (4), team health & safety (4), estimation & tooling (4), India layer (4), Epic management (4), release & version management (4), and cross-board / multi-team metrics (3)
 - **JQL search** — query issues with full Jira Query Language support, configurable field selection and pagination
 - **PR linking** — attach GitHub pull request URLs to Jira issues as remote links
 - **Transition by name** — transition issues using human-readable status names (e.g., "In Progress", "Done") without needing numeric transition IDs
@@ -21,7 +21,7 @@ Jira MCP server for [Claude Workflow Engine](https://github.com/techdeveloper-or
 - **Scrum math** — Bootstrap BCa CI for velocity, AHP pairwise DoD scoring, Tuckman Markov stage classification, PERT estimation, TCO NPV comparison
 - **Team health** — Spotify Squad Health Check (THS + Wilcoxon Z), Edmondson Psychological Safety Scale, cognitive load index, attrition forecast
 - **India layer** — IST timezone capacity correction, multi-sprint national holiday forecasting, NASSCOM AgileX L1-L5 maturity mapping
-- **Security** — all string/integer inputs validated; project keys and issue keys regex-guarded before JQL/URL construction; deps pinned
+- **Security** — all string/integer inputs validated; JQL values quote-escaped and URL path segments percent-encoded (`quote(value, safe="")`) before request construction; STRIDE-reviewed with zero residual findings; deps pinned
 - **Stdlib-only HTTP** — uses `urllib.request` exclusively; no `requests` or other runtime dependencies
 - **Windows-safe encoding** — ASCII-only source code, cp1252 compatible for Windows environments
 
@@ -60,7 +60,7 @@ Jira MCP server for [Claude Workflow Engine](https://github.com/techdeveloper-or
 |------|-------------|----------------|
 | `jira_plan_sprint` | Sprint planning report with capacity and velocity | `board_id`, `sprint_id` |
 | `jira_daily_standup` | Daily Scrum report for the active sprint | `board_id`, `sprint_id` |
-| `jira_sprint_review` | Sprint Review with AHP-weighted DoD scoring | `board_id`, `sprint_id` |
+| `jira_sprint_review` | Sprint Review; optional AHP-weighted DoD scoring via caller-supplied matrix | `board_id`, `sprint_id`, `dod_criteria_weights` |
 | `jira_retrospective` | Retrospective report with RE score and Tuckman stage | `sprint_id`, `board_id` |
 | `jira_refine_backlog` | Backlog refinement with WSJF scoring | `project_key`, `max_issues` |
 
@@ -109,6 +109,32 @@ Jira MCP server for [Claude Workflow Engine](https://github.com/techdeveloper-or
 | `jira_ist_capacity` | IST timezone capacity correction + Q1 buffer | `nominal_capacity`, `overlap_hours` |
 | `jira_nasscom_mapping` | NASSCOM AgileX L1-L5 maturity dimension mapping | `board_id`, `sprint_id` |
 | `jira_rate_limit_status` | Token bucket rate limiter state (read-only) | _(none)_ |
+
+### Epic Management (4)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_create_epic` | Create an Epic (issuetype=Epic) with name, summary, optional dates | `project_key`, `name`, `summary`, `start_date`, `due_date` |
+| `jira_get_epic` | Fetch Epic detail + linked-story rollup (count, story points, completion %) | `epic_key` |
+| `jira_link_to_epic` | Link an existing issue to an Epic (sets Epic Link field) | `issue_key`, `epic_key` |
+| `jira_list_epics` | List all Epics on a Scrum/Kanban board (Agile API) | `board_id` |
+
+### Release & Version Management (4)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_create_version` | Create a project version/release (unreleased) | `project_key`, `name`, `release_date`, `description` |
+| `jira_list_versions` | List project versions with released/archived state | `project_key` |
+| `jira_release_version` | Mark a version released (defaults release date to today) | `version_id`, `release_date` |
+| `jira_release_notes` | Generate release notes from issues in a fixVersion, grouped by type | `project_key`, `version_name` |
+
+### Cross-Board / Multi-Team Metrics (3)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `jira_program_velocity` | Aggregate velocity across boards: per-team + program total | `board_ids`, `num_sprints` |
+| `jira_cross_team_health` | Rank teams across boards by composite health score (Tuckman + AgileX) | `board_ids` |
+| `jira_dependency_check` | Detect cross-board "Blocks" dependencies between active-sprint issues | `board_ids` |
 
 ---
 
@@ -312,7 +338,7 @@ The server auto-selects ADF or plain text based on `JIRA_API_VERSION`. No code c
 
 ```
 mcp-jira-api/
-+-- server.py              # MCP server entry point (41 tools, FastMCP, urllib.request)
++-- server.py              # MCP server entry point (52 tools, FastMCP, urllib.request)
 +-- scrum_calculator.py    # Pure stdlib math: 24 functions (BCa, AHP, Tuckman, Little's Law, etc.)
 +-- agile_client.py        # Jira Agile REST API client (/rest/agile/1.0/)
 +-- base/                  # Shared base package (MCPResponse, @mcp_tool_handler, AtomicJsonStore)
@@ -325,6 +351,9 @@ mcp-jira-api/
 |   +-- test_scrum_calculator.py      # Unit tests for original math functions
 |   +-- test_scrum_calculator_new.py  # Unit tests for 16 new math functions (169 tests)
 |   +-- test_tools_integration_new.py # Integration tests for 16 new tools (84 tests)
+|   +-- test_tools_gaps.py            # Unit + branch tests for the 11 gap-closure tools
+|   +-- test_integration_gaps.py      # End-to-end flow tests for the gap-closure tools
+|   +-- pacts/                        # Pact CDC contracts (Jira REST request/response shapes)
 |   +-- fixtures/                     # JSON response fixtures for integration tests
 +-- README.md
 ```
@@ -349,7 +378,7 @@ This server is one of 13 MCP servers that power the [Claude Workflow Engine](htt
 | [mcp-standards-loader](https://github.com/techdeveloper-org/mcp-standards-loader) | 7 | Standards hot-reload |
 | [mcp-uml-diagram](https://github.com/techdeveloper-org/mcp-uml-diagram) | 15 | UML diagram generation |
 | [mcp-drawio-diagram](https://github.com/techdeveloper-org/mcp-drawio-diagram) | 5 | Draw.io editable diagrams |
-| **mcp-jira-api** | **41** | **Jira issue lifecycle + Agile metrics + Scrum Master (this repo)** |
+| **mcp-jira-api** | **52** | **Jira issue lifecycle + Agile metrics + Scrum Master + Epic/Release/Cross-board (this repo)** |
 | [mcp-jenkins-ci](https://github.com/techdeveloper-org/mcp-jenkins-ci) | 10 | Jenkins CI/CD |
 | [mcp-figma](https://github.com/techdeveloper-org/mcp-figma) | 10 | Figma design-to-code |
 

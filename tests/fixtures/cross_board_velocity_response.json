@@ -1,0 +1,1 @@
+{"sprints": [{"id": 1, "sequence": 1, "name": "Sprint 1", "state": "CLOSED", "goal": ""}, {"id": 2, "sequence": 2, "name": "Sprint 2", "state": "CLOSED", "goal": ""}], "velocityStatEntries": {"1": {"estimated": {"value": 20, "text": "20"}, "completed": {"value": 18, "text": "18"}}, "2": {"estimated": {"value": 22, "text": "22"}, "completed": {"value": 21, "text": "21"}}}}

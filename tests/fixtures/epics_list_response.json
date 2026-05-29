@@ -1,0 +1,1 @@
+{"values": [{"id": 1, "self": "https://test.atlassian.net/rest/agile/1.0/epic/1", "key": "PROJ-42", "summary": "Q1 Goals Epic", "done": false}, {"id": 2, "self": "https://test.atlassian.net/rest/agile/1.0/epic/2", "key": "PROJ-43", "summary": "Q2 Roadmap", "done": true}], "total": 2, "maxResults": 50, "startAt": 0}
