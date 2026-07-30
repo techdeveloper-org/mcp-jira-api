@@ -51,7 +51,13 @@ from pathlib import Path
 # Ensure src/mcp/ is in path for base package imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
+# Both names are probed so this server runs under either major version; the
+# API used below (tool decorator, run(transport=...)) is identical in both.
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp < 2.0
+    from mcp.server.fastmcp import FastMCP as MCPServer
 from base.decorators import mcp_tool_handler
 
 # Scrum Master extension imports
@@ -60,7 +66,7 @@ from base.response import success, error
 from input_validator import validate_input
 import scrum_calculator
 
-mcp = FastMCP(
+mcp = MCPServer(
     "jira-api",
     instructions="Jira operations via REST API (Cloud v3 ADF + Server v2 plain text)"
 )
