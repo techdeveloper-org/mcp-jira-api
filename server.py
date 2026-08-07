@@ -58,18 +58,96 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+
+try:
+    from mcp.types import ToolAnnotations
+except ImportError:  # pragma: no cover - annotations unsupported on this mcp
+    ToolAnnotations = None
+
 from base.decorators import mcp_tool_handler
 
 # Scrum Master extension imports
 from agile_client import _agile_request, _agile_url, _build_agile_auth_header, AgileClient
 from base.response import success, error
 from input_validator import validate_input
+from idempotency import run_once
 import scrum_calculator
 
 mcp = MCPServer(
     "jira-api",
     instructions="Jira operations via REST API (Cloud v3 ADF + Server v2 plain text)"
 )
+
+
+def _tool(read_only=False, destructive=True, idempotent=False, open_world=True):
+    """Register a tool with explicit MCP ToolAnnotations.
+
+    The MCP specification's per-hint defaults are readOnlyHint=false,
+    destructiveHint=true, idempotentHint=false and openWorldHint=true -- every
+    default points at the more dangerous value, so an unannotated tool is
+    indistinguishable from an explicit worst-case declaration. Every tool on
+    this server declares its four hints explicitly so a host's auto-approval and
+    automatic-retry decisions rest on a stated property rather than an omission.
+
+    Args:
+        read_only: True when the tool has no side effects at all.
+        destructive: True when the tool's effect is irreversible.
+        idempotent: True only when repeating the call with identical arguments
+            leaves the same cumulative effect as a single call. A tool made
+            retry-safe only by a caller-supplied idempotency key does not
+            qualify: the underlying operation stays non-idempotent and the
+            protection is conditional on the caller reusing the key.
+        open_world: True when the tool reaches an external system.
+
+    Returns:
+        The decorator returned by the underlying MCP tool registration.
+    """
+    if ToolAnnotations is None:
+        return mcp.tool()
+    try:
+        return mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=destructive,
+                idempotentHint=idempotent,
+                openWorldHint=open_world,
+            )
+        )
+    except TypeError:  # pragma: no cover - older mcp without annotations kwarg
+        return mcp.tool()
+
+
+_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,9}-[0-9]+$")
+
+
+def _safe_issue_key(issue_key: str) -> str:
+    """Validate an issue key before it is concatenated into a REST API path.
+
+    Several tools build their request path by string concatenation
+    (``"/issue/" + issue_key + "/transitions"``). An unvalidated value there is
+    path injection: a key of ``PROJ-1/../../project/OTHER`` addresses a
+    different resource than the caller named, and ``PROJ-1?expand=x`` appends a
+    query the caller never asked for. Constraining the value to Jira's own key
+    grammar removes both, and does so before the URL is built rather than by
+    escaping afterwards.
+
+    Args:
+        issue_key: Caller-supplied Jira issue key.
+
+    Returns:
+        The validated key, whitespace-trimmed.
+
+    Raises:
+        ValueError: If the key does not match Jira's PROJ-123 key grammar.
+    """
+    cleaned = validate_input(issue_key, max_length=64, field_name="issue_key")
+    if not _ISSUE_KEY_RE.match(cleaned):
+        raise ValueError(
+            "issue_key must match ^[A-Za-z][A-Za-z0-9]{0,9}-[0-9]+$ "
+            "(e.g. PROJ-123), got: " + cleaned
+        )
+    return cleaned
+
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -270,7 +348,7 @@ def _comment_body_field(cfg: Dict[str, str], text: str) -> Any:
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_create_issue(
     project_key: str,
@@ -280,8 +358,17 @@ def jira_create_issue(
     priority: Optional[str] = None,
     assignee: Optional[str] = None,
     labels: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> dict:
     """Create a Jira issue.
+
+    Jira's create-issue endpoint is not idempotent and offers no de-duplication
+    key of its own: a retry sent after a lost response files a second issue
+    that looks identical to the first. Supply ``idempotency_key`` -- generated
+    once when you decide to create the issue and reused unchanged on every
+    retry of that same decision -- so a repeat call replays the recorded result
+    instead of creating a duplicate. A key regenerated per attempt provides no
+    protection at all.
 
     Args:
         project_key: Jira project key (e.g. PROJ).
@@ -291,46 +378,52 @@ def jira_create_issue(
         priority: Priority name (e.g. High, Medium, Low). Optional.
         assignee: Assignee account ID (Cloud) or username (Server). Optional.
         labels: Comma-separated label names. Optional.
+        idempotency_key: Optional caller-generated key scoped to one logical
+            issue-creation intent.
     """
-    cfg = _get_config()
+    def _create() -> dict:
+        """Perform the underlying non-idempotent issue creation."""
+        cfg = _get_config()
 
-    fields: Dict[str, Any] = {
-        "project": {"key": project_key},
-        "summary": summary,
-        "issuetype": {"name": issue_type},
-    }
+        fields: Dict[str, Any] = {
+            "project": {"key": project_key},
+            "summary": summary,
+            "issuetype": {"name": issue_type},
+        }
 
-    if description:
-        fields["description"] = _description_field(cfg, description)
+        if description:
+            fields["description"] = _description_field(cfg, description)
 
-    if priority:
-        fields["priority"] = {"name": priority}
+        if priority:
+            fields["priority"] = {"name": priority}
 
-    if assignee:
-        if _is_cloud(cfg):
-            fields["assignee"] = {"accountId": assignee}
-        else:
-            fields["assignee"] = {"name": assignee}
+        if assignee:
+            if _is_cloud(cfg):
+                fields["assignee"] = {"accountId": assignee}
+            else:
+                fields["assignee"] = {"name": assignee}
 
-    if labels:
-        label_list = [lb.strip() for lb in labels.split(",") if lb.strip()]
-        if label_list:
-            fields["labels"] = label_list
+        if labels:
+            label_list = [lb.strip() for lb in labels.split(",") if lb.strip()]
+            if label_list:
+                fields["labels"] = label_list
 
-    body = {"fields": fields}
-    result = _request(cfg, "POST", "/issue", body)
+        body = {"fields": fields}
+        result = _request(cfg, "POST", "/issue", body)
 
-    return {
-        "issue_key": result.get("key"),
-        "issue_id": result.get("id"),
-        "issue_url": cfg["url"] + "/browse/" + result.get("key", ""),
-        "project_key": project_key,
-        "summary": summary,
-        "issue_type": issue_type,
-    }
+        return {
+            "issue_key": result.get("key"),
+            "issue_id": result.get("id"),
+            "issue_url": cfg["url"] + "/browse/" + result.get("key", ""),
+            "project_key": project_key,
+            "summary": summary,
+            "issue_type": issue_type,
+        }
+
+    return run_once("jira_create_issue", idempotency_key, _create)
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_get_issue(
     issue_key: str,
@@ -342,6 +435,7 @@ def jira_get_issue(
         issue_key: Issue key (e.g. PROJ-123).
         fields: Comma-separated field names to include. Optional (default: common fields).
     """
+    issue_key = _safe_issue_key(issue_key)
     cfg = _get_config()
 
     path = "/issue/" + issue_key
@@ -395,7 +489,7 @@ def jira_get_issue(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_search_issues(
     jql: str,
@@ -457,7 +551,7 @@ def jira_search_issues(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_get_transitions(issue_key: str) -> dict:
     """Get available workflow transitions for a Jira issue.
@@ -465,6 +559,7 @@ def jira_get_transitions(issue_key: str) -> dict:
     Args:
         issue_key: Issue key (e.g. PROJ-123).
     """
+    issue_key = _safe_issue_key(issue_key)
     cfg = _get_config()
 
     result = _request(cfg, "GET", "/issue/" + issue_key + "/transitions")
@@ -485,7 +580,7 @@ def jira_get_transitions(issue_key: str) -> dict:
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_transition_issue(
     issue_key: str,
@@ -501,6 +596,7 @@ def jira_transition_issue(
         transition_name: Transition name (e.g. "In Progress", "Done"). Case-insensitive.
         comment: Optional comment to add when transitioning.
     """
+    issue_key = _safe_issue_key(issue_key)
     cfg = _get_config()
 
     # Step 1: GET available transitions
@@ -548,7 +644,7 @@ def jira_transition_issue(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_add_comment(
     issue_key: str,
@@ -560,6 +656,7 @@ def jira_add_comment(
         issue_key: Issue key (e.g. PROJ-123).
         body: Comment text (plain text; converted to ADF for Cloud v3).
     """
+    issue_key = _safe_issue_key(issue_key)
     cfg = _get_config()
 
     payload: Dict[str, Any] = {
@@ -579,7 +676,7 @@ def jira_add_comment(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_link_pr(
     issue_key: str,
@@ -597,6 +694,7 @@ def jira_link_pr(
         pr_title: Display title for the link. Defaults to 'PR #{pr_number}'.
         pr_number: PR number for generating a default title. Optional.
     """
+    issue_key = _safe_issue_key(issue_key)
     cfg = _get_config()
 
     if not pr_title:
@@ -632,7 +730,7 @@ def jira_link_pr(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_list_projects(
     max_results: int = 50,
@@ -674,7 +772,7 @@ def jira_list_projects(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_update_issue(
     issue_key: str,
@@ -698,6 +796,7 @@ def jira_update_issue(
         labels: Comma-separated label names (replaces existing labels). Optional.
         status_comment: Comment to add alongside the update. Optional.
     """
+    issue_key = _safe_issue_key(issue_key)
     cfg = _get_config()
 
     fields: Dict[str, Any] = {}
@@ -753,7 +852,7 @@ def jira_update_issue(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_health_check() -> dict:
     """Verify Jira connectivity and configuration.
@@ -810,11 +909,76 @@ def _extract_story_points(fields: Dict[str, Any]) -> float:
     return 0.0
 
 
+_MAX_SPRINT_PAGES = 40
+
+
+def _recent_closed_sprints(
+    cfg: Dict[str, str], board_id: int, count: int
+) -> Dict[str, Any]:
+    """Return the ``count`` most recently closed sprints for a board.
+
+    The Agile API lists a board's sprints oldest-first and applies
+    ``maxResults`` by truncating from the front of that order. A request for
+    ``board/{id}/sprint?state=closed&maxResults=6`` therefore returns the six
+    *oldest* closed sprints on the board, not the six most recent -- so every
+    velocity average, trend comparison and health score derived from that slice
+    described the team's distant past and silently drifted further out of date
+    with each sprint the board completed. Nothing in the response distinguished
+    that from a correct answer.
+
+    The bound is applied after the full closed-sprint set has been walked, not
+    before: narrowing to "closed" and ordering are the API's job, but selecting
+    the most recent N is only meaningful once the end of the sequence is known.
+    Paging stops at _MAX_SPRINT_PAGES so a pathological board cannot spin here.
+
+    Args:
+        cfg: Config dict from _get_config().
+        board_id: Numeric board ID.
+        count: Number of most-recent closed sprints to return.
+
+    Returns:
+        Dict shaped like the raw Agile response, with ``values`` holding the
+        most recent ``count`` closed sprints in chronological order, plus
+        ``total`` (closed sprints seen) and ``pagination_truncated``.
+    """
+    count = max(1, count)
+    collected: List[Dict[str, Any]] = []
+    start_at = 0
+    page_size = 50
+    pages = 0
+    truncated = False
+
+    while pages < _MAX_SPRINT_PAGES:
+        result = _agile_request(
+            cfg, "GET",
+            "board/" + str(board_id) + "/sprint?state=closed&startAt="
+            + str(start_at) + "&maxResults=" + str(page_size)
+        )
+        if result is None:
+            result = {}
+
+        values = result.get("values", [])
+        collected.extend(values)
+        pages += 1
+
+        if result.get("isLast", True) or not values:
+            break
+        start_at += len(values)
+    else:
+        truncated = True
+
+    return {
+        "values": collected[-count:],
+        "total": len(collected),
+        "pagination_truncated": truncated,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Scrum Master Tools -- Agile Infrastructure (Group A: Tools 11-15 of 25)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_get_boards(
     project_key: Optional[str] = None,
@@ -869,7 +1033,7 @@ def jira_get_boards(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_get_sprints(
     board_id: int,
@@ -925,7 +1089,7 @@ def jira_get_sprints(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_create_sprint(
     board_id: int,
@@ -933,11 +1097,18 @@ def jira_create_sprint(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     goal: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> dict:
     """Create a new sprint on a Jira Software Scrum board.
 
     Calls the Jira Agile REST API POST /rest/agile/1.0/sprint.
     Newly created sprints are always in "future" state.
+
+    The Agile API happily accepts two sprints with the same name on the same
+    board, so a retry after a lost response leaves a duplicate sprint that the
+    team then has to reconcile by hand. Supply ``idempotency_key`` -- generated
+    once per logical intent and reused unchanged across every retry -- so a
+    repeat call replays the recorded sprint instead of creating another.
 
     Args:
         board_id: Numeric board ID to create the sprint on.
@@ -945,6 +1116,8 @@ def jira_create_sprint(
         start_date: Sprint start date in ISO format "YYYY-MM-DDTHH:MM:SS.000Z". Optional.
         end_date: Sprint end date in ISO format "YYYY-MM-DDTHH:MM:SS.000Z". Optional.
         goal: Sprint goal text. Optional.
+        idempotency_key: Optional caller-generated key scoped to one logical
+            sprint-creation intent.
 
     Returns:
         Dict with keys:
@@ -959,37 +1132,42 @@ def jira_create_sprint(
     Raises:
         ValueError: If name is empty.
     """
-    cfg = _get_config()
     if not name or not name.strip():
         raise ValueError("Sprint name must not be empty")
 
-    body: Dict[str, Any] = {
-        "originBoardId": board_id,
-        "name": name,
-    }
-    if start_date:
-        body["startDate"] = start_date
-    if end_date:
-        body["endDate"] = end_date
-    if goal:
-        body["goal"] = goal
+    def _create() -> dict:
+        """Perform the underlying non-idempotent sprint creation."""
+        cfg = _get_config()
 
-    result = _agile_request(cfg, "POST", "sprint", body)
-    if result is None:
-        result = {}
+        body: Dict[str, Any] = {
+            "originBoardId": board_id,
+            "name": name,
+        }
+        if start_date:
+            body["startDate"] = start_date
+        if end_date:
+            body["endDate"] = end_date
+        if goal:
+            body["goal"] = goal
 
-    return {
-        "sprint_id": result.get("id"),
-        "sprint_name": result.get("name", name),
-        "state": result.get("state", "future"),
-        "start_date": result.get("startDate", start_date or ""),
-        "end_date": result.get("endDate", end_date or ""),
-        "goal": result.get("goal", goal or ""),
-        "board_id": board_id,
-    }
+        result = _agile_request(cfg, "POST", "sprint", body)
+        if result is None:
+            result = {}
+
+        return {
+            "sprint_id": result.get("id"),
+            "sprint_name": result.get("name", name),
+            "state": result.get("state", "future"),
+            "start_date": result.get("startDate", start_date or ""),
+            "end_date": result.get("endDate", end_date or ""),
+            "goal": result.get("goal", goal or ""),
+            "board_id": board_id,
+        }
+
+    return run_once("jira_create_sprint", idempotency_key, _create)
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_start_sprint(
     sprint_id: int,
@@ -1039,7 +1217,7 @@ def jira_start_sprint(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=True, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_close_sprint(
     sprint_id: int,
@@ -1085,7 +1263,7 @@ def jira_close_sprint(
 # Scrum Master Tools -- Ceremony Facilitation (Group B: Tools 16-20 of 25)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_plan_sprint(
     board_id: int,
@@ -1188,7 +1366,7 @@ def jira_plan_sprint(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_daily_standup(
     sprint_id: int,
@@ -1290,7 +1468,7 @@ def jira_daily_standup(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_sprint_review(
     board_id: int,
@@ -1389,12 +1567,7 @@ def jira_sprint_review(
         (completed_points / committed_points * 100) if committed_points > 0 else 0.0, 1
     )
 
-    closed_sprints = _agile_request(
-        cfg, "GET",
-        "board/" + str(board_id) + "/sprint?state=closed&maxResults=6"
-    )
-    if closed_sprints is None:
-        closed_sprints = {}
+    closed_sprints = _recent_closed_sprints(cfg, board_id, 6)
 
     velocity_history = []
     for s in closed_sprints.get("values", []):
@@ -1480,7 +1653,7 @@ def jira_sprint_review(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_retrospective(
     sprint_id: int,
@@ -1512,12 +1685,7 @@ def jira_retrospective(
         sprint_detail = {}
     sprint_name = sprint_detail.get("name", "Sprint " + str(sprint_id))
 
-    closed_sprints = _agile_request(
-        cfg, "GET",
-        "board/" + str(board_id) + "/sprint?state=closed&maxResults=6"
-    )
-    if closed_sprints is None:
-        closed_sprints = {}
+    closed_sprints = _recent_closed_sprints(cfg, board_id, 6)
 
     velocity_history = []
     sprint_count = 0
@@ -1589,7 +1757,7 @@ def jira_retrospective(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_refine_backlog(
     project_key: str,
@@ -1725,7 +1893,7 @@ def jira_refine_backlog(
 # Scrum Master Tools -- Analytics (Group C: Tools 21-25 of 25)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_get_velocity(
     board_id: int,
@@ -1786,12 +1954,7 @@ def jira_get_velocity(
         vel_result = None
 
     if not velocity_points:
-        closed_sprints = _agile_request(
-            cfg, "GET",
-            "board/" + str(board_id) + "/sprint?state=closed&maxResults=" + str(num_sprints)
-        )
-        if closed_sprints is None:
-            closed_sprints = {}
+        closed_sprints = _recent_closed_sprints(cfg, board_id, num_sprints)
 
         for s in closed_sprints.get("values", []):
             sid = s.get("id")
@@ -1851,7 +2014,7 @@ def jira_get_velocity(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_get_sprint_metrics(
     board_id: int,
@@ -2022,7 +2185,7 @@ def jira_get_sprint_metrics(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_track_impediments(
     project_key: str,
@@ -2100,7 +2263,7 @@ def jira_track_impediments(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_team_health(
     board_id: int,
@@ -2125,12 +2288,7 @@ def jira_team_health(
     num_sprints = max(1, min(12, num_sprints))
 
     velocity_points = []
-    closed_sprints = _agile_request(
-        cfg, "GET",
-        "board/" + str(board_id) + "/sprint?state=closed&maxResults=" + str(num_sprints)
-    )
-    if closed_sprints is None:
-        closed_sprints = {}
+    closed_sprints = _recent_closed_sprints(cfg, board_id, num_sprints)
 
     for s in closed_sprints.get("values", []):
         sid = s.get("id")
@@ -2213,7 +2371,7 @@ def jira_team_health(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_monte_carlo_forecast(
     board_id: int,
@@ -2271,12 +2429,7 @@ def jira_monte_carlo_forecast(
         pass
 
     if len(velocity_points) < 2:
-        closed_sprints = _agile_request(
-            cfg, "GET",
-            "board/" + str(board_id) + "/sprint?state=closed&maxResults=" + str(num_velocity_samples)
-        )
-        if closed_sprints is None:
-            closed_sprints = {}
+        closed_sprints = _recent_closed_sprints(cfg, board_id, num_velocity_samples)
 
         for s in closed_sprints.get("values", []):
             sid = s.get("id")
@@ -2332,7 +2485,7 @@ def jira_monte_carlo_forecast(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_spotify_health_check(
     board_id: int,
@@ -2381,7 +2534,7 @@ def jira_spotify_health_check(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_psychological_safety(
     board_id: int,
@@ -2418,7 +2571,7 @@ def jira_psychological_safety(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_cognitive_load(
     board_id: int,
@@ -2462,7 +2615,7 @@ def jira_cognitive_load(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_attrition_forecast(
     board_id: int,
@@ -2502,7 +2655,7 @@ def jira_attrition_forecast(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_pert_estimate(
     optimistic: float,
@@ -2537,7 +2690,7 @@ def jira_pert_estimate(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_scrum_of_scrums(
     teams: int,
@@ -2575,7 +2728,7 @@ def jira_scrum_of_scrums(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_ist_capacity(
     nominal_capacity: float,
@@ -2608,7 +2761,7 @@ def jira_ist_capacity(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_multi_sprint_holidays(
     sprint_start: str,
@@ -2645,7 +2798,7 @@ def jira_multi_sprint_holidays(
     return result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_rate_limit_status() -> dict:
     """Return the current rate limiter bucket status (read-only).
@@ -2698,7 +2851,7 @@ def jira_rate_limit_status() -> dict:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_burndown_chart(board_id: int, sprint_id: int) -> dict:
     """Fetch sprint burndown data and compute burndown health metrics.
@@ -2770,7 +2923,7 @@ def jira_burndown_chart(board_id: int, sprint_id: int) -> dict:
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_cfd_analysis(board_id: int) -> dict:
     """Fetch cumulative flow diagram data and apply Little's Law analysis.
@@ -2837,7 +2990,7 @@ def jira_cfd_analysis(board_id: int) -> dict:
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_cycle_time_analysis(board_id: int, sprint_id: int) -> dict:
     """Compute cycle time distribution for issues resolved in a sprint.
@@ -2936,7 +3089,7 @@ def jira_cycle_time_analysis(board_id: int, sprint_id: int) -> dict:
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_throughput_forecast(
     board_id: int,
@@ -3016,7 +3169,7 @@ def jira_throughput_forecast(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_automation_analyzer(
     trigger_rates_json: str,
@@ -3140,7 +3293,7 @@ def jira_automation_analyzer(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_tco_analysis(
     user_count: int,
@@ -3193,7 +3346,7 @@ def jira_tco_analysis(
     return tco_result
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_nasscom_mapping(board_id: int, sprint_id: int) -> dict:
     """Map Jira sprint data to NASSCOM AgileX L1-L5 maturity dimensions.
@@ -3396,7 +3549,7 @@ def jira_nasscom_mapping(board_id: int, sprint_id: int) -> dict:
 # Epic Management Tools (4)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_create_epic(
     project_key: str,
@@ -3404,8 +3557,14 @@ def jira_create_epic(
     summary: str,
     start_date: Optional[str] = None,
     due_date: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> dict:
     """Create a Jira Epic in the specified project.
+
+    Epic creation is a plain issue creation and is therefore not idempotent.
+    Supply ``idempotency_key`` -- generated once per logical intent and reused
+    unchanged across every retry -- to make a retry after a lost response
+    replay the recorded epic rather than create a second one.
 
     Args:
         project_key: Jira project key (e.g. PROJ).
@@ -3413,6 +3572,8 @@ def jira_create_epic(
         summary: Epic title/summary displayed as the issue summary.
         start_date: Optional ISO-8601 start date string (e.g. 2026-06-01).
         due_date: Optional ISO-8601 due date string (e.g. 2026-09-30).
+        idempotency_key: Optional caller-generated key scoped to one logical
+            epic-creation intent.
 
     Returns:
         Dict with keys: epic_key, epic_id, summary, name, epic_url.
@@ -3420,30 +3581,35 @@ def jira_create_epic(
     project_key = validate_input(project_key, field_name="project_key")
     name = validate_input(name, field_name="name")
     summary = validate_input(summary, field_name="summary")
-    cfg = _get_config()
 
-    fields = {
-        "project": {"key": project_key},
-        "issuetype": {"name": "Epic"},
-        "summary": summary,
-        "customfield_10014": name,
-    }
-    if due_date:
-        fields["duedate"] = due_date
-    if start_date:
-        fields["customfield_10015"] = start_date
+    def _create() -> dict:
+        """Perform the underlying non-idempotent epic creation."""
+        cfg = _get_config()
 
-    result = _request(cfg, "POST", "/issue", {"fields": fields})
-    return {
-        "epic_key": result.get("key", ""),
-        "epic_id": result.get("id", ""),
-        "summary": summary,
-        "name": name,
-        "epic_url": cfg["url"] + "/browse/" + result.get("key", ""),
-    }
+        fields = {
+            "project": {"key": project_key},
+            "issuetype": {"name": "Epic"},
+            "summary": summary,
+            "customfield_10014": name,
+        }
+        if due_date:
+            fields["duedate"] = due_date
+        if start_date:
+            fields["customfield_10015"] = start_date
+
+        result = _request(cfg, "POST", "/issue", {"fields": fields})
+        return {
+            "epic_key": result.get("key", ""),
+            "epic_id": result.get("id", ""),
+            "summary": summary,
+            "name": name,
+            "epic_url": cfg["url"] + "/browse/" + result.get("key", ""),
+        }
+
+    return run_once("jira_create_epic", idempotency_key, _create)
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_get_epic(
     epic_key: str,
@@ -3457,7 +3623,7 @@ def jira_get_epic(
         Dict with keys: epic_key, summary, status, linked_story_count,
         story_points_total, done_story_count, completion_pct.
     """
-    epic_key = validate_input(epic_key, field_name="epic_key")
+    epic_key = _safe_issue_key(epic_key)
     cfg = _get_config()
 
     safe_epic_key = urllib.request.quote(epic_key, safe="")
@@ -3505,7 +3671,7 @@ def jira_get_epic(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_link_to_epic(
     issue_key: str,
@@ -3520,8 +3686,8 @@ def jira_link_to_epic(
     Returns:
         Dict with keys: issue_key, epic_key, linked (bool).
     """
-    issue_key = validate_input(issue_key, field_name="issue_key")
-    epic_key = validate_input(epic_key, field_name="epic_key")
+    issue_key = _safe_issue_key(issue_key)
+    epic_key = _safe_issue_key(epic_key)
     cfg = _get_config()
 
     _request(
@@ -3536,41 +3702,69 @@ def jira_link_to_epic(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_list_epics(
     board_id: int,
+    max_epics: int = 500,
 ) -> dict:
     """List all Epics for a Jira Software board.
 
     Uses the Agile REST API (/rest/agile/1.0/board/{id}/epic).
     Works only on Jira Software Scrum/Kanban boards.
 
+    The Agile API pages this endpoint at 50 results by default. The previous
+    implementation read exactly one page and then reported ``total`` as the
+    length of that page, so a board with 120 epics returned 50 of them labelled
+    "total: 50" -- indistinguishable from a board that genuinely has 50. This
+    now follows the ``isLast`` cursor to the end and reports ``truncated`` when
+    the caller's own bound stopped it early.
+
     Args:
         board_id: Numeric board ID.
+        max_epics: Upper bound on epics to return (default 500). Reaching this
+            bound sets ``truncated`` to True.
 
     Returns:
-        Dict with keys: board_id, epics (list of dicts), total.
+        Dict with keys: board_id, epics (list of dicts), total, truncated.
     """
     cfg = _get_config()
+    max_epics = max(1, max_epics)
 
-    result = _agile_request(cfg, "GET", "board/" + str(board_id) + "/epic")
-    if result is None:
-        result = {}
+    epics = []
+    start_at = 0
+    page_size = 50
+    truncated = False
 
-    raw_epics = result.get("values", [])
-    epics = [
-        {
-            "key": e.get("key", ""),
-            "summary": e.get("summary", ""),
-            "done": e.get("done", False),
-        }
-        for e in raw_epics
-    ]
+    while True:
+        result = _agile_request(
+            cfg, "GET",
+            "board/" + str(board_id) + "/epic?startAt=" + str(start_at)
+            + "&maxResults=" + str(page_size)
+        )
+        if result is None:
+            result = {}
+
+        raw_epics = result.get("values", [])
+        for e in raw_epics:
+            if len(epics) >= max_epics:
+                truncated = True
+                break
+            epics.append({
+                "key": e.get("key", ""),
+                "summary": e.get("summary", ""),
+                "done": e.get("done", False),
+            })
+
+        if truncated or result.get("isLast", True) or not raw_epics:
+            break
+        start_at += len(raw_epics)
+
     return {
         "board_id": board_id,
         "epics": epics,
         "total": len(epics),
+        "truncated": truncated,
     }
 
 
@@ -3578,50 +3772,63 @@ def jira_list_epics(
 # Release & Version Management Tools (4)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_create_version(
     project_key: str,
     name: str,
     release_date: Optional[str] = None,
     description: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> dict:
     """Create a project version (release) in Jira.
+
+    Version creation is not idempotent. Supply ``idempotency_key`` -- generated
+    once per logical intent and reused unchanged across every retry -- so a
+    retry after a lost response replays the recorded version instead of
+    creating a second one with the same name.
 
     Args:
         project_key: Jira project key (e.g. PROJ).
         name: Version name (e.g. v1.2.0).
         release_date: Optional ISO-8601 release date (e.g. 2026-06-30).
         description: Optional description of the release.
+        idempotency_key: Optional caller-generated key scoped to one logical
+            version-creation intent.
 
     Returns:
         Dict with keys: version_id, name, released, project_key.
     """
     project_key = validate_input(project_key, field_name="project_key")
     name = validate_input(name, field_name="name")
-    cfg = _get_config()
 
-    payload = {
-        "project": project_key,
-        "name": name,
-        "released": False,
-        "archived": False,
-    }
-    if release_date:
-        payload["releaseDate"] = release_date
-    if description:
-        payload["description"] = description
+    def _create() -> dict:
+        """Perform the underlying non-idempotent version creation."""
+        cfg = _get_config()
 
-    result = _request(cfg, "POST", "/version", payload)
-    return {
-        "version_id": result.get("id", ""),
-        "name": result.get("name", name),
-        "released": False,
-        "project_key": project_key,
-    }
+        payload = {
+            "project": project_key,
+            "name": name,
+            "released": False,
+            "archived": False,
+        }
+        if release_date:
+            payload["releaseDate"] = release_date
+        if description:
+            payload["description"] = description
+
+        result = _request(cfg, "POST", "/version", payload)
+        return {
+            "version_id": result.get("id", ""),
+            "name": result.get("name", name),
+            "released": False,
+            "project_key": project_key,
+        }
+
+    return run_once("jira_create_version", idempotency_key, _create)
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_list_versions(
     project_key: str,
@@ -3662,7 +3869,7 @@ def jira_list_versions(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=True, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_release_version(
     version_id: str,
@@ -3696,7 +3903,7 @@ def jira_release_version(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_release_notes(
     project_key: str,
@@ -3752,7 +3959,7 @@ def jira_release_notes(
 # Cross-Board / Multi-Team Metrics (3)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_program_velocity(
     board_ids: List[int],
@@ -3817,7 +4024,7 @@ def jira_program_velocity(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_cross_team_health(
     board_ids: List[int],
@@ -3851,12 +4058,7 @@ def jira_cross_team_health(
     team_scores = []
     for board_id in board_ids:
         velocity_points = []
-        closed = _agile_request(
-            cfg, "GET",
-            "board/" + str(board_id) + "/sprint?state=closed&maxResults=6"
-        )
-        if closed is None:
-            closed = {}
+        closed = _recent_closed_sprints(cfg, board_id, 6)
 
         for s in closed.get("values", []):
             sid = s.get("id")
@@ -3915,7 +4117,7 @@ def jira_cross_team_health(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jira_dependency_check(
     board_ids: List[int],
