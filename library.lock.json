@@ -1,0 +1,41 @@
+{
+  "schema": "library-project-sync-v1",
+  "library": {
+    "name": "claude-global-library",
+    "version": "29.82.1"
+  },
+  "agents": [
+    "agile-business-mathematics-expert",
+    "agile-tooling-specialist",
+    "business-development-agent",
+    "india-business-agent",
+    "revenue-operations-agent",
+    "scrum-master-agent"
+  ],
+  "skills": [
+    "agile-metrics-core",
+    "agile-team-health-core",
+    "india-bd-core",
+    "jira-devops-tooling-core",
+    "market-expansion-core",
+    "revenue-pricing-core",
+    "sales-pipeline-core",
+    "scrum-framework-core"
+  ],
+  "managed_files": [
+    ".claude/agents/agile-business-mathematics-expert.md",
+    ".claude/agents/agile-tooling-specialist.md",
+    ".claude/agents/business-development-agent.md",
+    ".claude/agents/india-business-agent.md",
+    ".claude/agents/revenue-operations-agent.md",
+    ".claude/agents/scrum-master-agent.md",
+    ".claude/skills/agile-metrics-core/SKILL.md",
+    ".claude/skills/agile-team-health-core/SKILL.md",
+    ".claude/skills/india-bd-core/SKILL.md",
+    ".claude/skills/jira-devops-tooling-core/SKILL.md",
+    ".claude/skills/market-expansion-core/SKILL.md",
+    ".claude/skills/revenue-pricing-core/SKILL.md",
+    ".claude/skills/sales-pipeline-core/SKILL.md",
+    ".claude/skills/scrum-framework-core/SKILL.md"
+  ]
+}
