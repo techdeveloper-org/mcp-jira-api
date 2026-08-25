@@ -218,8 +218,12 @@ def _api_url(cfg: Dict[str, str], path: str) -> str:
     Args:
         cfg: Config dict.
         path: API path starting with / (e.g. /issue/PROJ-123).
-            Use the special prefix NOVERSION: to bypass version prefix
-            (e.g. NOVERSION:/rest/serverInfo).
+            Use the special prefix NOVERSION: to bypass the version
+            prefix. This is for the Agile API, which lives at
+            /rest/agile/1.0/... (e.g. NOVERSION:/rest/agile/1.0/board).
+            Core API resources are versioned and must NOT use it --
+            the previous example here, NOVERSION:/rest/serverInfo,
+            was itself the bug in issue #3.
 
     Returns:
         Full URL string.
@@ -861,7 +865,12 @@ def jira_health_check() -> dict:
     """
     cfg = _get_config()
 
-    result = _request(cfg, "GET", "NOVERSION:/rest/serverInfo")
+    # serverInfo is an ordinary VERSIONED Core API resource, not an
+    # Agile one. It was the only non-Agile caller of the NOVERSION:
+    # prefix, which produced /rest/serverInfo -- a path Jira does not
+    # serve, so this tool 404'd on every Cloud site regardless of
+    # whether the credentials were valid. Issue #3.
+    result = _request(cfg, "GET", "/serverInfo")
 
     return {
         "connected": True,
