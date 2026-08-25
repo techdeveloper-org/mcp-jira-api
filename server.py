@@ -295,27 +295,91 @@ def _is_cloud(cfg: Dict[str, str]) -> bool:
     return cfg["api_version"] == "3"
 
 
-def _text_to_adf(text: str) -> Dict[str, Any]:
-    """Wrap plain text in minimal ADF document format (Cloud v3).
+def _adf_paragraph(para: str) -> Dict[str, Any]:
+    """Build one ADF paragraph, mapping single newlines to hardBreak nodes.
+
+    ADF ignores a newline character inside a text node, so a line break has to
+    be its own node or it disappears from the rendered issue.
 
     Args:
-        text: Plain text content to wrap.
+        para: One paragraph of plain text, possibly containing single newlines.
 
     Returns:
-        ADF document dict.
+        An ADF paragraph node.
     """
+    content: List[Dict[str, Any]] = []
+    for i, line in enumerate(para.split("\n")):
+        if i:
+            content.append({"type": "hardBreak"})
+        if line:
+            content.append({"type": "text", "text": line})
+    if not content:
+        content = [{"type": "text", "text": ""}]
+    return {"type": "paragraph", "content": content}
+
+
+def _text_to_adf(text: str) -> Dict[str, Any]:
+    """Convert plain text to an ADF document, one paragraph per paragraph.
+
+    Paragraphs are separated by a blank line, matching how the text was
+    written. Issue #4: this previously emitted a SINGLE paragraph node holding
+    the entire text with raw newlines inside it. ADF renders neither the
+    newlines nor the paragraph breaks, so every structured description -- one
+    with steps, or acceptance criteria, or a before/after contrast -- arrived
+    in Jira as one undifferentiated block. It degraded exactly the tickets
+    carrying the most information.
+
+    Args:
+        text: Plain text content to convert.
+
+    Returns:
+        ADF document dict with one paragraph node per source paragraph.
+    """
+    paras = [p for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+    if not paras:
+        paras = [""]
     return {
         "type": "doc",
         "version": 1,
-        "content": [
-            {
-                "type": "paragraph",
-                "content": [
-                    {"type": "text", "text": text}
-                ]
-            }
-        ]
+        "content": [_adf_paragraph(p) for p in paras],
     }
+
+
+def _adf_to_text(value: Any) -> str:
+    """Flatten a description field to plain text, whatever shape it arrives in.
+
+    Jira Cloud (v3) returns an ADF document; Jira Server (v2) returns a plain
+    string. Callers want the text either way, so both are handled here rather
+    than at every call site.
+
+    Paragraph nodes are joined with a blank line and hardBreak nodes with a
+    single newline, which round-trips the structure `_text_to_adf` writes.
+
+    Args:
+        value: An ADF document dict, a plain string, or None.
+
+    Returns:
+        Plain text, or "" when the field is absent.
+    """
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+
+    def walk(node: Any) -> str:
+        if isinstance(node, list):
+            return "".join(walk(n) for n in node)
+        if not isinstance(node, dict):
+            return ""
+        kind = node.get("type")
+        if kind == "text":
+            return node.get("text", "")
+        if kind == "hardBreak":
+            return "\n"
+        inner = walk(node.get("content", []))
+        return inner + "\n\n" if kind == "paragraph" else inner
+
+    return walk(value.get("content", [])).strip()
 
 
 def _description_field(cfg: Dict[str, str], text: str) -> Any:
@@ -477,11 +541,16 @@ def jira_get_issue(
     issuetype_raw = raw_fields.get("issuetype") or {}
     issuetype_name = issuetype_raw.get("name", "")
 
+    # Issue #5: description was absent from this dict entirely -- a caller
+    # could write one and never read it back. Cloud returns ADF and Server
+    # returns a plain string, so it is flattened here: most consumers want the
+    # text, not a nested document they have to walk themselves.
     return {
         "issue_key": result.get("key"),
         "issue_id": result.get("id"),
         "issue_url": cfg["url"] + "/browse/" + result.get("key", ""),
         "summary": raw_fields.get("summary", ""),
+        "description": _adf_to_text(raw_fields.get("description")),
         "status": status_name,
         "issue_type": issuetype_name,
         "priority": priority_name,
