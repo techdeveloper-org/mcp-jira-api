@@ -2,9 +2,8 @@
 
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License MIT](https://img.shields.io/badge/license-MIT-green)
-![Part of claude-workflow-engine](https://img.shields.io/badge/part%20of-claude--workflow--engine-orange)
 
-Jira MCP server for [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine). Provides full Jira Cloud and Jira Server/Data Center integration — create and transition issues, search with JQL, add comments, link GitHub PRs, and manage the complete issue lifecycle directly from Claude Code. Supports Jira Cloud REST API v3 with Atlassian Document Format (ADF) and Jira Server/Data Center REST API v2 with plain text, all over stdio transport using Python stdlib only (no external HTTP dependencies).
+Jira MCP server. Provides full Jira Cloud and Jira Server/Data Center integration — create and transition issues, search with JQL, add comments, link GitHub PRs, and manage the complete issue lifecycle directly from Claude Code. Supports Jira Cloud REST API v3 with Atlassian Document Format (ADF) and Jira Server/Data Center REST API v2 with plain text, all over stdio transport using Python stdlib only (no external HTTP dependencies).
 
 ---
 
@@ -362,9 +361,11 @@ The `base/` directory contains the shared library used across all 13 MCP servers
 
 ---
 
-## Part of Claude Workflow Engine
+## Related projects
 
-This server is one of 13 MCP servers that power the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine), a LangGraph-based orchestration pipeline for automating end-to-end Claude Code development workflows.
+> **Standalone.** This server has no runtime dependency on any other project. It speaks MCP over stdio and works with any MCP client.
+
+It is also one of 13 MCP servers used by the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine), a LangGraph-based orchestration pipeline for automating end-to-end Claude Code development workflows.
 
 | Server | Tools | Purpose |
 |--------|-------|---------|
