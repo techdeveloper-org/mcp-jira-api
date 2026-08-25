@@ -103,10 +103,21 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 
 ## Environment Variables
 
-- `JIRA_URL` — Jira server URL (required)
-- `JIRA_EMAIL` — Jira account email (for Cloud Basic auth)
-- `JIRA_API_TOKEN` — Jira API token (Cloud) or password (Server)
-- `JIRA_DEFAULT_PROJECT` — Default project key (optional)
+These are supplied by the **MCP client**, not by a `.env` file — this server
+reads `os.environ` directly and nothing in the repo calls `load_dotenv()`. For
+Claude Code they go in `~/.claude/settings.json` under
+`mcpServers -> jira-api -> env`.
+
+- `JIRA_URL` — required. Base URL, e.g. `https://company.atlassian.net`
+- `JIRA_USER` — required. Email address for Jira Cloud, or username for Server
+- `JIRA_API_TOKEN` — required. API token (Cloud) or PAT/password (Server)
+- `JIRA_API_VERSION` — optional, default `3`. Use `2` for Server/Data Center
+- `JIRA_AUTH_METHOD` — optional, default `basic`. `bearer` for a Server PAT
+
+**Corrected:** this list previously named the second variable `JIRA_EMAIL`,
+which `server.py` has never read — it reads `JIRA_USER`. `README.md` had it
+right; this file and `.env.example` had drifted from it. `JIRA_DEFAULT_PROJECT`
+was also listed here and is **not implemented** — see `.env.example` for why.
 
 ---
 
