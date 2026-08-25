@@ -2250,11 +2250,11 @@ def jira_get_sprint_metrics(
             done_issues / float(total_issues) * 100, 1)
         measured = True
 
-    if state != "active":
-        sprint_health = "Not Started" if state == "future" else "Closed"
+    if sprint_state != "active":
+        sprint_health = "Not Started" if sprint_state == "future" else "Closed"
         health_reason = (
             "Sprint state is '%s'; health applies to active sprints"
-            % state)
+            % sprint_state)
         projected_completion_pct = None
     elif not measured:
         sprint_health = "No Data"
