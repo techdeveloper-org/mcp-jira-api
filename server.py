@@ -591,7 +591,7 @@ def jira_search_issues(
     else:
         body["fields"] = ["summary", "status", "assignee", "priority", "issuetype", "created"]
 
-    result = _request(cfg, "POST", "/issue/search", body)
+    result = _request(cfg, "POST", "/search/jql", body)
 
     issues = []
     for issue in result.get("issues", []):
@@ -616,10 +616,16 @@ def jira_search_issues(
             "created": raw_fields.get("created", ""),
         })
 
+    # Issue #6. /search/jql returns exactly [isLast, issues] -- no total,
+    # no startAt, no maxResults, because Jira moved this endpoint from
+    # offset pagination to a cursor. Reporting the old keys would emit
+    # total: 0 next to a populated issue list, which a caller testing
+    # "total == 0" reads as no matches while holding matches. The true
+    # total is not obtainable from this endpoint at all, so it is not
+    # reported rather than fabricated.
     return {
-        "total": result.get("total", 0),
-        "max_results": result.get("maxResults", 0),
-        "start_at": result.get("startAt", 0),
+        "count": len(issues),
+        "is_last": bool(result.get("isLast", True)),
         "issues": issues,
     }
 
@@ -1529,8 +1535,14 @@ def jira_daily_standup(
         else:
             progress_by_assignee[assignee_name]["todo"] += 1
 
-    from datetime import datetime
-    standup_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ") + " (UTC)"
+    # Issue #8: this field is named ..._ist and returned UTC, with
+    # " (UTC)" appended -- the code contradicted its own key inside one
+    # expression. IST is UTC+5:30, so the error crossed a working-day
+    # boundary: a 10:22 IST standup was reported as 04:52.
+    from datetime import datetime, timedelta, timezone
+    _ist = timezone(timedelta(hours=5, minutes=30))
+    standup_ts = datetime.now(_ist).strftime(
+        "%Y-%m-%dT%H:%M:%S+05:30 (IST)")
 
     return {
         "sprint_id": sprint_id,
@@ -1798,7 +1810,7 @@ def jira_retrospective(
             + " AND labels = retro-action ORDER BY created DESC"
         )
         action_search = _request(
-            cfg, "POST", "/issue/search",
+            cfg, "POST", "/search/jql",
             {"jql": action_jql, "maxResults": 50, "fields": ["summary", "status"]}
         )
         if action_search:
@@ -1881,7 +1893,7 @@ def jira_refine_backlog(
     )
 
     search_result = _request(
-        cfg, "POST", "/issue/search",
+        cfg, "POST", "/search/jql",
         {
             "jql": jql,
             "maxResults": max_issues,
@@ -2218,7 +2230,30 @@ def jira_get_sprint_metrics(
                 min(100.0, projected_total / story_points_total * 100), 1
             )
 
-    if projected_completion_pct >= 80:
+    # Issue #7. projected_completion_pct is initialised to 0.0 and only
+    # computed when story_points_total > 0, so the branch below read
+    # "never measured" as "zero per cent done". Two silent consequences:
+    # a sprint that had not started reported "Off Track", and any team
+    # tracking by issue count rather than story points reported "Off
+    # Track" permanently -- story_points_total was always 0, and the
+    # issue counts this function already computes were never consulted.
+    measured = story_points_total > 0
+    if not measured and total_issues > 0:
+        projected_completion_pct = round(
+            done_issues / float(total_issues) * 100, 1)
+        measured = True
+
+    if state != "active":
+        sprint_health = "Not Started" if state == "future" else "Closed"
+        health_reason = (
+            "Sprint state is '%s'; health applies to active sprints"
+            % state)
+        projected_completion_pct = None
+    elif not measured:
+        sprint_health = "No Data"
+        health_reason = "Sprint has no issues and no story points"
+        projected_completion_pct = None
+    elif projected_completion_pct >= 80:
         sprint_health = "On Track"
         health_reason = "Projected completion >= 80%"
     elif projected_completion_pct >= 50:
@@ -2294,7 +2329,7 @@ def jira_track_impediments(
     jql += " ORDER BY created ASC"
 
     search_result = _request(
-        cfg, "POST", "/issue/search",
+        cfg, "POST", "/search/jql",
         {
             "jql": jql,
             "maxResults": 100,
