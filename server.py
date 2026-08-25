@@ -567,7 +567,7 @@ def jira_get_issue(
 def jira_search_issues(
     jql: str,
     max_results: int = 20,
-    start_at: int = 0,
+    next_page_token: Optional[str] = None,
     fields: Optional[str] = None,
 ) -> dict:
     """Search Jira issues using JQL (Jira Query Language).
@@ -575,7 +575,12 @@ def jira_search_issues(
     Args:
         jql: JQL query string (e.g. 'project = PROJ AND status = "In Progress"').
         max_results: Maximum number of results to return (default: 20, max: 100).
-        start_at: Zero-based index for pagination (default: 0).
+        next_page_token: Cursor from a previous call's next_page_token,
+            to fetch the following page. Optional.
+            Issue #6: this was `start_at`, an offset. /search/jql is
+            cursor-paginated and rejects startAt with a 400, so an offset
+            cannot be honoured here and is not accepted rather than
+            silently ignored.
         fields: Comma-separated field names to include. Optional.
     """
     cfg = _get_config()
@@ -583,8 +588,9 @@ def jira_search_issues(
     body: Dict[str, Any] = {
         "jql": jql,
         "maxResults": min(max_results, 100),
-        "startAt": start_at,
     }
+    if next_page_token:
+        body["nextPageToken"] = next_page_token
 
     if fields:
         body["fields"] = [f.strip() for f in fields.split(",") if f.strip()]
@@ -626,6 +632,7 @@ def jira_search_issues(
     return {
         "count": len(issues),
         "is_last": bool(result.get("isLast", True)),
+        "next_page_token": result.get("nextPageToken", ""),
         "issues": issues,
     }
 
