@@ -32,7 +32,7 @@ Jira MCP server. Provides full Jira Cloud and Jira Server/Data Center integratio
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
-| `jira_create_issue` | Create a new Jira issue | `project_key`, `summary`, `issue_type`, `description`, `priority`, `assignee`, `labels` |
+| `jira_create_issue` | Create a new Jira issue | `project_key`, `summary`, `issue_type`, `description`, `priority`, `assignee`, `labels`, `story_points`, `components`, `parent` |
 | `jira_get_issue` | Fetch a single issue by key | `issue_key`, `fields` |
 | `jira_search_issues` | Search issues using JQL | `jql`, `max_results`, `start_at`, `fields` |
 | `jira_get_transitions` | List available transitions for an issue | `issue_key` |
@@ -40,7 +40,7 @@ Jira MCP server. Provides full Jira Cloud and Jira Server/Data Center integratio
 | `jira_add_comment` | Add a comment to an issue | `issue_key`, `body` |
 | `jira_link_pr` | Attach a GitHub PR URL as a remote link | `issue_key`, `pr_url`, `pr_title`, `pr_number` |
 | `jira_list_projects` | List accessible Jira projects | `max_results`, `project_type` |
-| `jira_update_issue` | Update fields on an existing issue | `issue_key`, `summary`, `description`, `priority`, `assignee`, `labels` |
+| `jira_update_issue` | Update fields on an existing issue | `issue_key`, `summary`, `description`, `priority`, `assignee`, `labels`, `story_points`, `components` |
 | `jira_health_check` | Verify connectivity and credentials | _(none)_ |
 
 ### Scrum Master — Board & Sprint Infrastructure (6)
@@ -195,6 +195,7 @@ All configuration is provided via environment variables. The server reads these 
 | `JIRA_API_TOKEN` | Yes | — | API token for Jira Cloud (generated at [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens)), or Personal Access Token / password for Jira Server. |
 | `JIRA_API_VERSION` | No | `3` | Set to `3` for Jira Cloud (ADF format) or `2` for Jira Server/Data Center (plain text). |
 | `JIRA_AUTH_METHOD` | No | `basic` | Authentication method: `basic` sends `Basic base64(user:token)`, `bearer` sends `Bearer {token}` (for PAT on Jira Server). |
+| `JIRA_STORY_POINTS_FIELD` | No | `customfield_10016` | Custom field ID for Story Points. Jira does not standardize this across instances/templates — `customfield_10016` is the Jira Cloud "Scrum" template default; set this if your project's Story Points field has a different ID (Jira admin → Issues → Custom fields, or inspect a Story issue's raw field payload). Used by `jira_create_issue`/`jira_update_issue` when their `story_points` argument is supplied. |
 | `ENABLE_JIRA` | No | `0` | Pipeline integration flag. Set to `1` to activate Jira lifecycle steps (8/9/10/11/12) in the Claude Workflow Engine pipeline. |
 
 ### Obtaining a Jira Cloud API Token

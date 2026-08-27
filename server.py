@@ -160,7 +160,7 @@ def _get_config() -> Dict[str, str]:
     """Read Jira config from environment variables.
 
     Returns:
-        Dict with url, user, token, api_version, auth_method keys.
+        Dict with url, user, token, api_version, auth_method, story_points_field keys.
 
     Raises:
         EnvironmentError: If JIRA_URL, JIRA_USER, or JIRA_API_TOKEN are missing.
@@ -170,6 +170,10 @@ def _get_config() -> Dict[str, str]:
     token = os.environ.get("JIRA_API_TOKEN", "")
     api_version = os.environ.get("JIRA_API_VERSION", "3")
     auth_method = os.environ.get("JIRA_AUTH_METHOD", "basic").lower()
+    # Jira does not standardize the Story Points custom field ID across instances.
+    # customfield_10016 is the default on Jira Cloud's out-of-box "Scrum" project
+    # template; instances that differ must set JIRA_STORY_POINTS_FIELD explicitly.
+    story_points_field = os.environ.get("JIRA_STORY_POINTS_FIELD", "customfield_10016")
 
     missing = []
     if not url:
@@ -192,6 +196,7 @@ def _get_config() -> Dict[str, str]:
         "token": token,
         "api_version": api_version,
         "auth_method": auth_method,
+        "story_points_field": story_points_field,
     }
 
 
@@ -426,6 +431,9 @@ def jira_create_issue(
     priority: Optional[str] = None,
     assignee: Optional[str] = None,
     labels: Optional[str] = None,
+    story_points: Optional[float] = None,
+    components: Optional[str] = None,
+    parent: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> dict:
     """Create a Jira issue.
@@ -441,11 +449,20 @@ def jira_create_issue(
     Args:
         project_key: Jira project key (e.g. PROJ).
         summary: Issue summary/title.
-        issue_type: Issue type name (e.g. Task, Bug, Story). Default: Task.
+        issue_type: Issue type name (e.g. Task, Bug, Story, Sub-task). Default: Task.
         description: Issue description (plain text; converted to ADF for Cloud).
         priority: Priority name (e.g. High, Medium, Low). Optional.
         assignee: Assignee account ID (Cloud) or username (Server). Optional.
         labels: Comma-separated label names. Optional.
+        story_points: Story point estimate. Written to the field named by the
+            JIRA_STORY_POINTS_FIELD env var (default: customfield_10016, the
+            Jira Cloud "Scrum" template default -- set the env var if this
+            instance's Story Points field differs). Optional.
+        components: Comma-separated component names (must already exist on the
+            project). Optional.
+        parent: Parent issue key (e.g. PROJ-10). Required by Jira when
+            issue_type="Sub-task"; ignored by Jira for any other issue type.
+            Optional.
         idempotency_key: Optional caller-generated key scoped to one logical
             issue-creation intent.
     """
@@ -475,6 +492,17 @@ def jira_create_issue(
             label_list = [lb.strip() for lb in labels.split(",") if lb.strip()]
             if label_list:
                 fields["labels"] = label_list
+
+        if story_points is not None:
+            fields[cfg["story_points_field"]] = story_points
+
+        if components:
+            component_list = [c.strip() for c in components.split(",") if c.strip()]
+            if component_list:
+                fields["components"] = [{"name": c} for c in component_list]
+
+        if parent:
+            fields["parent"] = {"key": _safe_issue_key(parent)}
 
         body = {"fields": fields}
         result = _request(cfg, "POST", "/issue", body)
@@ -978,6 +1006,8 @@ def jira_update_issue(
     priority: Optional[str] = None,
     assignee: Optional[str] = None,
     labels: Optional[str] = None,
+    story_points: Optional[float] = None,
+    components: Optional[str] = None,
     status_comment: Optional[str] = None,
 ) -> dict:
     """Update fields on an existing Jira issue.
@@ -991,6 +1021,11 @@ def jira_update_issue(
         priority: Priority name (e.g. High, Medium). Optional.
         assignee: Assignee account ID (Cloud) or username (Server). Optional.
         labels: Comma-separated label names (replaces existing labels). Optional.
+        story_points: New story point estimate. Written to the field named by
+            the JIRA_STORY_POINTS_FIELD env var (default: customfield_10016).
+            Optional.
+        components: Comma-separated component names, replaces existing
+            components (must already exist on the project). Optional.
         status_comment: Comment to add alongside the update. Optional.
     """
     issue_key = _safe_issue_key(issue_key)
@@ -1016,6 +1051,13 @@ def jira_update_issue(
     if labels is not None:
         label_list = [lb.strip() for lb in labels.split(",") if lb.strip()]
         fields["labels"] = label_list
+
+    if story_points is not None:
+        fields[cfg["story_points_field"]] = story_points
+
+    if components is not None:
+        component_list = [c.strip() for c in components.split(",") if c.strip()]
+        fields["components"] = [{"name": c} for c in component_list]
 
     if not fields and not status_comment:
         raise ValueError("At least one field to update or a status_comment must be provided.")
@@ -1089,19 +1131,42 @@ _SP_FIELD_CANDIDATES = [
 ]
 
 
-def _extract_story_points(fields: Dict[str, Any]) -> float:
+def _extract_story_points(
+    fields: Dict[str, Any],
+    cfg: Optional[Dict[str, str]] = None,
+) -> float:
     """Extract story points from an issue fields dict, trying multiple field names.
 
     Jira does not standardize the story points field name across instances.
-    This helper tries the most common field names in priority order.
+    The instance-configured field (JIRA_STORY_POINTS_FIELD, threaded through
+    via cfg["story_points_field"]) is checked FIRST -- it is the operator's
+    explicit statement of which field is correct for THIS instance, so it
+    must win over the generic fallback candidates, not lose to whichever of
+    them happens to be earlier in the list. The hardcoded candidates remain
+    as a fallback for callers that don't have cfg in scope, and for the
+    common case where the configured field IS one of them (the default,
+    customfield_10016, already is).
 
     Args:
         fields: Raw issue fields dict from a Jira API response.
+        cfg: Config dict from _get_config(). Optional so existing callers
+            that have not been updated to pass it still work, falling back
+            to the hardcoded candidates only.
 
     Returns:
         Story points as float, or 0.0 if no recognized field is found or parseable.
     """
-    for candidate in _SP_FIELD_CANDIDATES:
+    candidates = _SP_FIELD_CANDIDATES
+    if cfg:
+        configured = cfg.get("story_points_field")
+        if configured and configured not in candidates:
+            candidates = [configured] + candidates
+        elif configured:
+            # Already in the list -- move it to the front so it still wins
+            # priority over the other hardcoded candidates when configured.
+            candidates = [configured] + [c for c in candidates if c != configured]
+
+    for candidate in candidates:
         val = fields.get(candidate)
         if val is not None:
             try:
@@ -1109,6 +1174,30 @@ def _extract_story_points(fields: Dict[str, Any]) -> float:
             except (TypeError, ValueError):
                 continue
     return 0.0
+
+
+def _sp_fields_param(cfg: Dict[str, str], extra: str = "") -> str:
+    """Build a Jira `fields=` query fragment that is guaranteed to request
+    the instance-configured Story Points field alongside the generic
+    fallback candidates, so _extract_story_points() has the configured
+    field available in the API response to read from.
+
+    Args:
+        cfg: Config dict from _get_config() (must include story_points_field).
+        extra: Additional comma-separated field names to prepend (e.g.
+            "status" or "summary,status,issuetype"). Optional.
+
+    Returns:
+        Comma-separated field list for a `fields=` query parameter. The
+        configured field is never duplicated if it already equals one of
+        the hardcoded candidates (the default case).
+    """
+    candidates = list(_SP_FIELD_CANDIDATES)
+    configured = cfg.get("story_points_field")
+    if configured and configured not in candidates:
+        candidates.append(configured)
+    sp_fields = ",".join(candidates)
+    return (extra + "," + sp_fields) if extra else sp_fields
 
 
 _MAX_SPRINT_PAGES = 40
@@ -1583,7 +1672,7 @@ def jira_plan_sprint(
 
     issues_result = _agile_request(
         cfg, "GET",
-        "sprint/" + str(sprint_id) + "/issue?maxResults=100&fields=summary,status,customfield_10016,customfield_10028,story_points"
+        "sprint/" + str(sprint_id) + "/issue?maxResults=100&fields=" + _sp_fields_param(cfg, "summary,status")
     )
     if issues_result is None:
         issues_result = {}
@@ -1593,7 +1682,7 @@ def jira_plan_sprint(
     estimated_total_points = 0.0
     unestimated_count = 0
     for issue in raw_issues:
-        sp = _extract_story_points(issue.get("fields", {}))
+        sp = _extract_story_points(issue.get("fields", {}), cfg)
         if sp > 0:
             estimated_total_points += sp
         else:
@@ -1775,7 +1864,7 @@ def jira_sprint_review(
 
     issues_result = _agile_request(
         cfg, "GET",
-        "sprint/" + str(sprint_id) + "/issue?maxResults=100&fields=summary,status,assignee,issuetype,customfield_10016,customfield_10028,story_points,subtasks"
+        "sprint/" + str(sprint_id) + "/issue?maxResults=100&fields=" + _sp_fields_param(cfg, "summary,status,assignee,issuetype") + ",subtasks"
     )
     if issues_result is None:
         issues_result = {}
@@ -1790,7 +1879,7 @@ def jira_sprint_review(
     for issue in raw_issues:
         fields = issue.get("fields", {})
         status_name = (fields.get("status") or {}).get("name", "")
-        sp = _extract_story_points(fields)
+        sp = _extract_story_points(fields, cfg)
         committed_points += sp
 
         status_lower = status_name.lower()
@@ -1839,11 +1928,11 @@ def jira_sprint_review(
         if sid:
             si_result = _agile_request(
                 cfg, "GET",
-                "sprint/" + str(sid) + "/issue?maxResults=200&fields=status,customfield_10016,customfield_10028,story_points"
+                "sprint/" + str(sid) + "/issue?maxResults=200&fields=" + _sp_fields_param(cfg, "status")
             )
             if si_result:
                 sp_sum = sum(
-                    _extract_story_points(i.get("fields", {}))
+                    _extract_story_points(i.get("fields", {}), cfg)
                     for i in si_result.get("issues", [])
                     if (i.get("fields", {}).get("status") or {}).get("name", "").lower()
                     in ("done", "closed", "resolved")
@@ -1959,11 +2048,11 @@ def jira_retrospective(
         if sid:
             si_result = _agile_request(
                 cfg, "GET",
-                "sprint/" + str(sid) + "/issue?maxResults=200&fields=status,customfield_10016,customfield_10028,story_points"
+                "sprint/" + str(sid) + "/issue?maxResults=200&fields=" + _sp_fields_param(cfg, "status")
             )
             if si_result:
                 sp_sum = sum(
-                    _extract_story_points(i.get("fields", {}))
+                    _extract_story_points(i.get("fields", {}), cfg)
                     for i in si_result.get("issues", [])
                     if (i.get("fields", {}).get("status") or {}).get("name", "").lower()
                     in ("done", "closed", "resolved")
@@ -2057,6 +2146,8 @@ def jira_refine_backlog(
 
     fields_list = ["summary", "status", "issuetype", "priority", "customfield_10016",
                    "customfield_10028", "story_points", "description"]
+    if cfg["story_points_field"] not in fields_list:
+        fields_list.append(cfg["story_points_field"])
     if epic_link_field:
         fields_list.append(epic_link_field)
 
@@ -2084,7 +2175,7 @@ def jira_refine_backlog(
     wsjf_stories = []
     for issue in raw_issues:
         fields = issue.get("fields", {})
-        sp = _extract_story_points(fields)
+        sp = _extract_story_points(fields, cfg)
         if sp == 0:
             unestimated_count += 1
 
@@ -2225,11 +2316,11 @@ def jira_get_velocity(
             if sid:
                 si = _agile_request(
                     cfg, "GET",
-                    "sprint/" + str(sid) + "/issue?maxResults=200&fields=status,customfield_10016,customfield_10028,story_points"
+                    "sprint/" + str(sid) + "/issue?maxResults=200&fields=" + _sp_fields_param(cfg, "status")
                 )
                 if si:
                     sp_sum = sum(
-                        _extract_story_points(i.get("fields", {}))
+                        _extract_story_points(i.get("fields", {}), cfg)
                         for i in si.get("issues", [])
                         if (i.get("fields", {}).get("status") or {}).get("name", "").lower()
                         in ("done", "closed", "resolved")
@@ -2318,7 +2409,7 @@ def jira_get_sprint_metrics(
 
     issues_result = _agile_request(
         cfg, "GET",
-        "sprint/" + str(sprint_id) + "/issue?maxResults=200&fields=summary,status,issuetype,created,customfield_10016,customfield_10028,story_points"
+        "sprint/" + str(sprint_id) + "/issue?maxResults=200&fields=" + _sp_fields_param(cfg, "summary,status,issuetype,created")
     )
     if issues_result is None:
         issues_result = {}
@@ -2347,7 +2438,7 @@ def jira_get_sprint_metrics(
         fields = issue.get("fields", {})
         status_name = (fields.get("status") or {}).get("name", "")
         status_lower = status_name.lower()
-        sp = _extract_story_points(fields)
+        sp = _extract_story_points(fields, cfg)
         story_points_total += sp
 
         it_name = (fields.get("issuetype") or {}).get("name", "Unknown")
@@ -2582,11 +2673,11 @@ def jira_team_health(
         if sid:
             si = _agile_request(
                 cfg, "GET",
-                "sprint/" + str(sid) + "/issue?maxResults=200&fields=status,customfield_10016,customfield_10028,story_points"
+                "sprint/" + str(sid) + "/issue?maxResults=200&fields=" + _sp_fields_param(cfg, "status")
             )
             if si:
                 sp_sum = sum(
-                    _extract_story_points(i.get("fields", {}))
+                    _extract_story_points(i.get("fields", {}), cfg)
                     for i in si.get("issues", [])
                     if (i.get("fields", {}).get("status") or {}).get("name", "").lower()
                     in ("done", "closed", "resolved")
@@ -2723,11 +2814,11 @@ def jira_monte_carlo_forecast(
             if sid:
                 si = _agile_request(
                     cfg, "GET",
-                    "sprint/" + str(sid) + "/issue?maxResults=200&fields=status,customfield_10016,customfield_10028,story_points"
+                    "sprint/" + str(sid) + "/issue?maxResults=200&fields=" + _sp_fields_param(cfg, "status")
                 )
                 if si:
                     sp_sum = sum(
-                        _extract_story_points(i.get("fields", {}))
+                        _extract_story_points(i.get("fields", {}), cfg)
                         for i in si.get("issues", [])
                         if (i.get("fields", {}).get("status") or {}).get("name", "").lower()
                         in ("done", "closed", "resolved")
@@ -3673,7 +3764,7 @@ def jira_nasscom_mapping(board_id: int, sprint_id: int) -> dict:
 
     sprint_issues_raw = client.get_sprint_issues(
         sprint_id,
-        fields="summary,status,created,resolutiondate,story_points,customfield_10016,customfield_10028"
+        fields=_sp_fields_param(cfg, "summary,status,created,resolutiondate")
     )
     if sprint_issues_raw is None:
         sprint_issues_raw = {}
@@ -3719,17 +3810,9 @@ def jira_nasscom_mapping(board_id: int, sprint_id: int) -> dict:
     estimated_issues = 0
     for issue in issue_list:
         fields = issue.get("fields") or {}
-        sp = (
-            fields.get("story_points")
-            or fields.get("customfield_10016")
-            or fields.get("customfield_10028")
-        )
-        if sp is not None:
-            try:
-                if float(sp) > 0:
-                    estimated_issues += 1
-            except (TypeError, ValueError):
-                pass
+        sp = _extract_story_points(fields, cfg)
+        if sp > 0:
+            estimated_issues += 1
 
     has_goal = bool(sprint_goal and sprint_goal.strip())
     has_estimates = estimated_issues > 0
@@ -3931,7 +4014,7 @@ def jira_get_epic(
     stories_result = _request(
         cfg, "GET",
         "/search?jql=" + urllib.request.quote(jql)
-        + "&fields=summary,status,customfield_10016,customfield_10028,story_points"
+        + "&fields=" + _sp_fields_param(cfg, "summary,status")
         + "&maxResults=100"
     )
 
@@ -3940,7 +4023,7 @@ def jira_get_epic(
     sp_total = 0.0
     done_count = 0
     for issue in story_issues:
-        sp = _extract_story_points(issue.get("fields", {}))
+        sp = _extract_story_points(issue.get("fields", {}), cfg)
         sp_total += sp
         st_name = (issue.get("fields", {}).get("status") or {}).get("name", "")
         if st_name.lower() in ("done", "closed", "resolved"):
@@ -4354,11 +4437,11 @@ def jira_cross_team_health(
             if sid:
                 si = _agile_request(
                     cfg, "GET",
-                    "sprint/" + str(sid) + "/issue?maxResults=200&fields=status,customfield_10016,customfield_10028,story_points"
+                    "sprint/" + str(sid) + "/issue?maxResults=200&fields=" + _sp_fields_param(cfg, "status")
                 )
                 if si:
                     sp_sum = sum(
-                        _extract_story_points(i.get("fields", {}))
+                        _extract_story_points(i.get("fields", {}), cfg)
                         for i in si.get("issues", [])
                         if (i.get("fields", {}).get("status") or {}).get("name", "").lower()
                         in ("done", "closed", "resolved")
