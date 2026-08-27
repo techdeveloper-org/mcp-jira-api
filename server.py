@@ -5,15 +5,15 @@ Supports both Jira Cloud (v3, ADF format) and Jira Server/Data Center (v2, plain
 Backend: urllib.request (stdlib only, no external deps)
 Transport: stdio
 
-Tools (53):
+Tools (54):
   Core Jira (11):
     jira_create_issue, jira_get_issue, jira_search_issues,
     jira_transition_issue, jira_add_comment, jira_link_pr,
     jira_list_projects, jira_create_project, jira_get_transitions,
     jira_update_issue, jira_health_check
-  Scrum Master -- Board & Sprint Infrastructure (5):
+  Scrum Master -- Board & Sprint Infrastructure (6):
     jira_get_boards, jira_get_sprints, jira_create_sprint,
-    jira_start_sprint, jira_close_sprint
+    jira_start_sprint, jira_close_sprint, jira_move_issues_to_sprint
   Scrum Master -- Ceremony Facilitation (5):
     jira_plan_sprint, jira_daily_standup, jira_sprint_review,
     jira_retrospective, jira_refine_backlog
@@ -1458,6 +1458,62 @@ def jira_close_sprint(
         "state": result.get("state", "closed"),
         "complete_date": result.get("completeDate", complete_date or ""),
         "closed": True,
+    }
+
+
+@_tool(read_only=False, destructive=False, idempotent=True, open_world=True)
+@mcp_tool_handler
+def jira_move_issues_to_sprint(
+    sprint_id: int,
+    issue_keys: str,
+) -> dict:
+    """Move one or more existing issues into a sprint.
+
+    Calls the Jira Agile REST API POST /rest/agile/1.0/sprint/{sprintId}/issue
+    with body {"issues": [...]}. Moving an issue that is already in the target
+    sprint is a no-op upstream, so repeating this call with the same arguments
+    leaves the same end state -- genuinely idempotent, no key needed. The Jira
+    Agile API caps this endpoint at 50 issues per call; more than 50 keys are
+    sent automatically in successive batches of 50.
+
+    Args:
+        sprint_id: Numeric sprint ID to move the issues into (from
+            jira_create_sprint or jira_get_sprints).
+        issue_keys: Comma-separated issue keys (e.g. "PROJ-1,PROJ-2,PROJ-3").
+
+    Returns:
+        Dict with keys:
+            sprint_id (int): Echo of sprint_id.
+            moved_count (int): Total number of issues moved.
+            batches (int): Number of API calls made (ceil(moved_count / 50)).
+            issue_keys (list[str]): The validated, deduplicated-order issue
+                keys that were sent.
+
+    Raises:
+        ValueError: If issue_keys contains no usable issue key.
+    """
+    cfg = _get_config()
+    raw_keys = [k.strip() for k in issue_keys.split(",") if k.strip()]
+    keys = [_safe_issue_key(k) for k in raw_keys]
+    if not keys:
+        raise ValueError("issue_keys must contain at least one issue key")
+
+    batch_size = 50
+    batches = 0
+    for i in range(0, len(keys), batch_size):
+        batch = keys[i:i + batch_size]
+        _agile_request(
+            cfg, "POST",
+            "sprint/" + str(sprint_id) + "/issue",
+            {"issues": batch}
+        )
+        batches += 1
+
+    return {
+        "sprint_id": sprint_id,
+        "moved_count": len(keys),
+        "batches": batches,
+        "issue_keys": keys,
     }
 
 

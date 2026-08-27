@@ -336,6 +336,74 @@ class TestJiraCloseSprint:
         assert body_sent["state"] == "closed"
 
 
+class TestJiraMoveIssuesToSprint:
+    """Tests for jira_move_issues_to_sprint tool."""
+
+    @patch("urllib.request.urlopen")
+    def test_happy_path_moved_count(self, mock_urlopen, jira_env):
+        """Happy path: moved_count matches the number of keys passed."""
+        mock_urlopen.return_value = _make_empty_urlopen_response()
+
+        import server
+        result = _parse(server.jira_move_issues_to_sprint(
+            sprint_id=35, issue_keys="FAB-1,FAB-2,FAB-3"
+        ))
+
+        assert result["success"] is True
+        assert result["sprint_id"] == 35
+        assert result["moved_count"] == 3
+        assert result["batches"] == 1
+        assert result["issue_keys"] == ["FAB-1", "FAB-2", "FAB-3"]
+
+    @patch("urllib.request.urlopen")
+    def test_request_body_sets_issues_array(self, mock_urlopen, jira_env):
+        """POST body sent to Agile API includes the issues array."""
+        mock_urlopen.return_value = _make_empty_urlopen_response()
+
+        import server
+        server.jira_move_issues_to_sprint(sprint_id=35, issue_keys="FAB-1, FAB-2")
+
+        req_obj = mock_urlopen.call_args[0][0]
+        body_sent = json.loads(req_obj.data.decode("utf-8"))
+        assert body_sent["issues"] == ["FAB-1", "FAB-2"]
+
+    @patch("urllib.request.urlopen")
+    def test_batches_over_fifty_keys(self, mock_urlopen, jira_env):
+        """More than 50 keys are sent in successive batches of 50."""
+        mock_urlopen.return_value = _make_empty_urlopen_response()
+        keys = ",".join("FAB-%d" % i for i in range(1, 61))  # 60 keys
+
+        import server
+        result = _parse(server.jira_move_issues_to_sprint(
+            sprint_id=35, issue_keys=keys
+        ))
+
+        assert result["success"] is True
+        assert result["moved_count"] == 60
+        assert result["batches"] == 2
+        assert mock_urlopen.call_count == 2
+
+    def test_empty_issue_keys_returns_error_json(self, jira_env):
+        """Empty/whitespace-only issue_keys returns success=False, not a crash."""
+        import server
+        result = _parse(server.jira_move_issues_to_sprint(
+            sprint_id=35, issue_keys="   ,  ,"
+        ))
+        assert result["success"] is False
+
+    def test_missing_env_returns_error_json(self, monkeypatch):
+        """Missing env vars returns success=False JSON."""
+        monkeypatch.delenv("JIRA_URL", raising=False)
+        monkeypatch.delenv("JIRA_USER", raising=False)
+        monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+
+        import server
+        result = _parse(server.jira_move_issues_to_sprint(
+            sprint_id=35, issue_keys="FAB-1"
+        ))
+        assert result["success"] is False
+
+
 # ---------------------------------------------------------------------------
 # Group B: Ceremony Facilitation tools (tools 16-20 of 25)
 # ---------------------------------------------------------------------------

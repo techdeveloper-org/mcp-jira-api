@@ -43,7 +43,7 @@ Jira MCP server. Provides full Jira Cloud and Jira Server/Data Center integratio
 | `jira_update_issue` | Update fields on an existing issue | `issue_key`, `summary`, `description`, `priority`, `assignee`, `labels` |
 | `jira_health_check` | Verify connectivity and credentials | _(none)_ |
 
-### Scrum Master — Board & Sprint Infrastructure (5)
+### Scrum Master — Board & Sprint Infrastructure (6)
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
@@ -52,6 +52,7 @@ Jira MCP server. Provides full Jira Cloud and Jira Server/Data Center integratio
 | `jira_create_sprint` | Create a new sprint | `board_id`, `name`, `start_date`, `end_date`, `goal` |
 | `jira_start_sprint` | Start a future sprint | `sprint_id`, `board_id` |
 | `jira_close_sprint` | Complete an active sprint | `sprint_id`, `board_id` |
+| `jira_move_issues_to_sprint` | Move existing issues into a sprint | `sprint_id`, `issue_keys` (comma-separated) |
 
 ### Scrum Master — Ceremony Facilitation (5)
 
