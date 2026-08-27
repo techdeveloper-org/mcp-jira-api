@@ -3799,7 +3799,9 @@ def jira_create_epic(
 
     Args:
         project_key: Jira project key (e.g. PROJ).
-        name: Epic name (short label shown on the epic; Cloud customfield_10014).
+        name: Epic name (short label shown on the epic; Cloud customfield_10011,
+            "Epic Name" -- distinct from customfield_10014 "Epic Link", which is
+            the field jira_link_to_epic sets on a *story* to point back at this epic).
         summary: Epic title/summary displayed as the issue summary.
         start_date: Optional ISO-8601 start date string (e.g. 2026-06-01).
         due_date: Optional ISO-8601 due date string (e.g. 2026-09-30).
@@ -3821,7 +3823,7 @@ def jira_create_epic(
             "project": {"key": project_key},
             "issuetype": {"name": "Epic"},
             "summary": summary,
-            "customfield_10014": name,
+            "customfield_10011": name,
         }
         if due_date:
             fields["duedate"] = due_date

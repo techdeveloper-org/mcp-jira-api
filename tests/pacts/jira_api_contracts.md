@@ -16,7 +16,8 @@ segment (cfg["api_version"]) for Core API, shown as /rest/api/{ver}/...
 - Request:
   - Method: POST
   - Path: /rest/api/{ver}/issue
-  - Body: {"fields": {"project": {"key": "<project_key>"}, "issuetype": {"name": "Epic"}, "summary": "<summary>", "customfield_10014": "<name>", "duedate"?: "<due_date>", "customfield_10015"?: "<start_date>"}}
+  - Body: {"fields": {"project": {"key": "<project_key>"}, "issuetype": {"name": "Epic"}, "summary": "<summary>", "customfield_10011": "<name>", "duedate"?: "<due_date>", "customfield_10015"?: "<start_date>"}}
+  - Note: customfield_10011 is "Epic Name" -- do not confuse with customfield_10014 "Epic Link" (set by jira_link_to_epic on a *story*, not on the epic itself).
 - Response (200/201):
   - {"id": "<id>", "key": "<KEY>"}
 - Tool consumes: result["key"], result["id"]
