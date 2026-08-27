@@ -5,12 +5,12 @@ Supports both Jira Cloud (v3, ADF format) and Jira Server/Data Center (v2, plain
 Backend: urllib.request (stdlib only, no external deps)
 Transport: stdio
 
-Tools (52):
-  Core Jira (10):
+Tools (53):
+  Core Jira (11):
     jira_create_issue, jira_get_issue, jira_search_issues,
     jira_transition_issue, jira_add_comment, jira_link_pr,
-    jira_list_projects, jira_get_transitions, jira_update_issue,
-    jira_health_check
+    jira_list_projects, jira_create_project, jira_get_transitions,
+    jira_update_issue, jira_health_check
   Scrum Master -- Board & Sprint Infrastructure (5):
     jira_get_boards, jira_get_sprints, jira_create_sprint,
     jira_start_sprint, jira_close_sprint
@@ -856,6 +856,117 @@ def jira_list_projects(
         "projects": projects,
         "count": len(projects),
     }
+
+
+_PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
+
+# Company-managed (classic) templates only. Team-managed ("next-gen") project
+# creation requires a different, less stable API surface and is intentionally
+# not offered here -- a caller wanting that gets a clear error, not a project
+# created under the wrong model.
+_PROJECT_TEMPLATES = {
+    "scrum": "com.pyxis.greenhopper.jira:gh-scrum-template",
+    "kanban": "com.pyxis.greenhopper.jira:gh-kanban-template",
+}
+
+
+@_tool(read_only=False, destructive=True, idempotent=False, open_world=True)
+@mcp_tool_handler
+def jira_create_project(
+    key: str,
+    name: str,
+    template: str = "scrum",
+    description: Optional[str] = None,
+    lead_account_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> dict:
+    """Create a company-managed (classic) Jira Software project.
+
+    Project creation is destructive in the sense that a wrong key cannot be
+    renamed later without breaking every issue reference built on it, and it
+    is not idempotent: Jira's create-project endpoint has no de-duplication
+    key of its own, and a retry sent after a lost response attempts a second
+    project with the same key, which then fails with a confusing "key already
+    exists" error rather than cleanly returning the first project. Supply
+    ``idempotency_key`` -- generated once per logical intent and reused
+    unchanged across every retry -- so a repeat call replays the recorded
+    project instead of re-attempting creation.
+
+    Only company-managed (classic) templates are supported (see
+    ``_PROJECT_TEMPLATES``). Team-managed ("next-gen") projects use a
+    different, less stable creation API and are out of scope for this tool.
+
+    Args:
+        key: Project key, 2-10 uppercase letters/digits, starting with a
+            letter (e.g. FAB). Jira enforces this same grammar server-side;
+            it is validated here first so a malformed key fails locally
+            instead of after a network round trip.
+        name: Project display name.
+        template: One of "scrum" or "kanban". Default: "scrum".
+        description: Optional project description.
+        lead_account_id: Optional Cloud accountId to set as project lead.
+            When omitted, the authenticated user (GET /myself) is used --
+            Jira Cloud rejects project creation with no lead at all, so a
+            default here removes a near-mandatory extra round trip for the
+            common case of "I am creating a project I will also lead".
+        idempotency_key: Optional caller-generated key scoped to one logical
+            project-creation intent.
+
+    Returns:
+        Dict with keys: project_key, project_id, project_url, name, template.
+
+    Raises:
+        ValueError: If key is malformed or template is not a recognized name.
+    """
+    key = validate_input(key, max_length=10, field_name="key")
+    if not _PROJECT_KEY_RE.match(key):
+        raise ValueError(
+            "key must match ^[A-Z][A-Z0-9]{1,9}$ (2-10 uppercase "
+            "letters/digits, starting with a letter), got: " + key
+        )
+    name = validate_input(name, field_name="name")
+    if template not in _PROJECT_TEMPLATES:
+        raise ValueError(
+            "template must be one of " + ", ".join(sorted(_PROJECT_TEMPLATES))
+            + ", got: " + template
+        )
+
+    def _create() -> dict:
+        """Perform the underlying non-idempotent project creation."""
+        cfg = _get_config()
+
+        lead = lead_account_id
+        if not lead:
+            me = _request(cfg, "GET", "/myself")
+            lead = (me or {}).get("accountId")
+            if not lead:
+                raise RuntimeError(
+                    "Could not resolve lead_account_id from /myself; pass "
+                    "lead_account_id explicitly."
+                )
+
+        payload: Dict[str, Any] = {
+            "key": key,
+            "name": name,
+            "projectTypeKey": "software",
+            "projectTemplateKey": _PROJECT_TEMPLATES[template],
+            "leadAccountId": lead,
+        }
+        if description:
+            payload["description"] = description
+
+        result = _request(cfg, "POST", "/project", payload)
+
+        return {
+            "project_key": result.get("key", key),
+            "project_id": result.get("id", ""),
+            "project_url": cfg["url"] + "/jira/software/projects/"
+            + result.get("key", key) + "/boards",
+            "name": name,
+            "template": template,
+        }
+
+    return run_once("jira_create_project", idempotency_key, _create)
 
 
 @_tool(read_only=False, destructive=False, idempotent=False, open_world=True)

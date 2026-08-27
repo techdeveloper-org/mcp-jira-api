@@ -192,6 +192,89 @@ class TestVersionLifecycleFlow(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Scenario 2b: Project creation -- explicit lead, resolved lead, and
+# validation-before-network-call for a malformed key/template.
+# ---------------------------------------------------------------------------
+
+
+class TestProjectCreationFlow(unittest.TestCase):
+    """jira_create_project: explicit lead, auto-resolved lead, and rejects."""
+
+    def setUp(self):
+        _set_env()
+
+    def tearDown(self):
+        _clear_env()
+
+    @patch("urllib.request.urlopen")
+    def test_create_with_explicit_lead_account_id(self, mock_urlopen):
+        """An explicit lead_account_id skips the /myself lookup entirely."""
+        mock_urlopen.return_value = _make_resp({"id": "10033", "key": "FAB"})
+
+        created = _parse(
+            server.jira_create_project(
+                "FAB", "Freelancer Auto Bidder", lead_account_id="abc123"
+            )
+        )
+        assert created["success"] is True
+        assert created["project_key"] == "FAB"
+        assert created["project_id"] == "10033"
+        assert created["template"] == "scrum"
+
+        assert mock_urlopen.call_count == 1
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data.decode("utf-8"))
+        assert body["key"] == "FAB"
+        assert body["leadAccountId"] == "abc123"
+        assert body["projectTemplateKey"] == "com.pyxis.greenhopper.jira:gh-scrum-template"
+
+    @patch("urllib.request.urlopen")
+    def test_create_without_lead_resolves_via_myself(self, mock_urlopen):
+        """Omitting lead_account_id calls GET /myself first, then POST /project."""
+        mock_urlopen.side_effect = [
+            _make_resp({"accountId": "resolved-me-id"}),
+            _make_resp({"id": "10034", "key": "FAB2"}),
+        ]
+
+        created = _parse(
+            server.jira_create_project("FAB2", "Second Project", template="kanban")
+        )
+        assert created["success"] is True
+        assert created["project_key"] == "FAB2"
+
+        assert mock_urlopen.call_count == 2
+        myself_req, project_req = (c[0][0] for c in mock_urlopen.call_args_list)
+        assert "/myself" in (myself_req.full_url if hasattr(myself_req, "full_url") else str(myself_req))
+        body = json.loads(project_req.data.decode("utf-8"))
+        assert body["leadAccountId"] == "resolved-me-id"
+        assert body["projectTemplateKey"] == "com.pyxis.greenhopper.jira:gh-kanban-template"
+
+    @patch("urllib.request.urlopen")
+    def test_malformed_key_rejected_before_network_call(self, mock_urlopen):
+        """A lowercase/too-short key fails validation; no HTTP request is made.
+
+        @mcp_tool_handler catches the ValueError and returns it as
+        {"success": False, "error_type": "ValueError", ...} -- it never
+        propagates to the caller, so this asserts on the parsed JSON rather
+        than a raised exception.
+        """
+        result = _parse(server.jira_create_project("fab", "Bad Key"))
+        assert result["success"] is False
+        assert result["error_type"] == "ValueError"
+        mock_urlopen.assert_not_called()
+
+    @patch("urllib.request.urlopen")
+    def test_unknown_template_rejected_before_network_call(self, mock_urlopen):
+        """An unrecognized template name fails validation; no HTTP request is made."""
+        result = _parse(
+            server.jira_create_project("FAB", "Name", template="waterfall")
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "ValueError"
+        mock_urlopen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Scenario 3: AHP backward compat integration
 # ---------------------------------------------------------------------------
 
