@@ -48,6 +48,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -4590,13 +4591,38 @@ def jira_dependency_check(
 # The mutation tool targets Jira Cloud's newer JSON-based Bulk Update
 # Workflows API (POST /rest/api/3/workflows/update, preceded by a mandatory
 # call to its /update/validation sibling). That API has changed shape more
-# than once since its introduction, and the exact payload built below is a
-# best-effort reconstruction from Atlassian's public documentation and
-# developer-community reports as of 2026-09-08 -- the full OpenAPI schema
-# could not be retrieved during research. This is why the tool always
-# validates before applying: a schema mismatch surfaces as Jira's own
-# validation error text (see _extract_workflow_validation_errors) rather than
-# as a silent partial mutation of a live workflow.
+# than once since its introduction, and its full OpenAPI schema could not be
+# retrieved during research (the swagger-v3.v3.json spec document is too
+# large to fetch/search in full through available tooling). The payload
+# below was corrected on 2026-09-08 (GitHub issue #10) after a first
+# best-effort attempt was rejected by Jira's own validation endpoint with a
+# generic 400. The correction is cross-referenced across Atlassian support
+# docs and multiple independent Atlassian Developer Community threads
+# (including one quoting a real payload an Atlassian staff member confirmed
+# worked) rather than a single source, and fixes two concrete defects in the
+# first attempt:
+#   1. workflows[].id must be the workflow's real entityId (a UUID, read
+#      back from GET /workflow/search's own top-level "id" field) plus a
+#      "version" object ({"id", "versionNumber"}, also from that same GET
+#      response) for optimistic locking. The first attempt sent the
+#      workflow's display *name* as "id" and omitted "version" entirely.
+#   2. Every statusReference value must itself be UUID-formatted -- it is
+#      only a same-request correlation key, never persisted or looked up,
+#      but Jira's validator rejects a non-UUID string outright. The first
+#      attempt used plain labels ("after-status", "new-status", etc).
+# This correction is NOT yet confirmed by a live validate_only=True call
+# against a real Jira instance: the fix was made by editing this file's
+# already-running MCP server process in place, and that process does not
+# reload edited source (confirmed by adding then querying for a canary
+# field that never appeared in a live jira_get_workflow_info response
+# after the edit) -- so the next real call through a freshly (re)started
+# jira-api MCP connection is the first one that will actually exercise
+# this code. Run jira_add_workflow_status with validate_only=True first
+# and confirm it returns a clean validated=True before ever omitting
+# validate_only. This is why the tool always validates before applying: a
+# remaining schema mismatch surfaces as Jira's own validation error text
+# (see _extract_workflow_validation_errors) rather than as a silent
+# partial mutation of a live workflow.
 
 _STATUS_CATEGORIES = frozenset({"TODO", "IN_PROGRESS", "DONE"})
 _WORKFLOWS_VALIDATE_PATH = "/workflows/update/validation"
@@ -4757,20 +4783,28 @@ def _workflow_names_in_scheme(scheme: Dict[str, Any]) -> List[str]:
 
 
 def _fetch_workflow_detail(cfg: Dict[str, str], workflow_name: str) -> Dict[str, Any]:
-    """Fetch one workflow's current statuses and transitions.
+    """Fetch one workflow's current identity, statuses, and transitions.
 
     Uses ``GET /rest/api/3/workflow/search``, the read-only workflow
-    inspection endpoint. This endpoint is independent of the newer
-    JSON-based Bulk Workflows API used for mutation below, so a schema
-    change in the mutation API does not affect this read path.
+    inspection endpoint for the same JSON-based Workflows API the Bulk
+    Update Workflows mutation endpoint operates on. Unlike the older
+    classic-workflow APIs, this endpoint's response shape mirrors the
+    mutation request shape by design: each entry carries a top-level
+    ``id`` (the workflow's entityId, a UUID -- not its display name) and
+    a ``version`` object (``{"id": ..., "versionNumber": ...}``) used for
+    optimistic locking on update. Both are captured here because
+    ``jira_add_workflow_status`` must echo them back unchanged in its
+    mutation payload's ``workflows[]`` entry.
 
     Args:
         cfg: Config dict.
         workflow_name: Exact workflow name.
 
     Returns:
-        Dict with keys: name, statuses (list of {id, name}), transitions
-        (list of {id, name, from (list of status names), to, type}).
+        Dict with keys: name, entity_id (the workflow's UUID, or None if
+        the response did not carry one), version (the raw version dict,
+        or None), statuses (list of {id, name}), transitions (list of
+        {id, name, from (list of status names), to, type}).
 
     Raises:
         RuntimeError: If Jira returns no workflow with this name.
@@ -4811,7 +4845,13 @@ def _fetch_workflow_detail(cfg: Dict[str, str], workflow_name: str) -> Dict[str,
         }
         for t in (wf.get("transitions") or [])
     ]
-    return {"name": workflow_name, "statuses": statuses, "transitions": transitions}
+    return {
+        "name": workflow_name,
+        "entity_id": wf.get("id"),
+        "version": wf.get("version"),
+        "statuses": statuses,
+        "transitions": transitions,
+    }
 
 
 def _resolve_status_id(cfg: Dict[str, str], status_name: str) -> Optional[str]:
@@ -5163,6 +5203,17 @@ def jira_add_workflow_status(
             target_workflow_name = available_workflow_names[0]
 
         detail = _fetch_workflow_detail(cfg, target_workflow_name)
+        workflow_entity_id = detail.get("entity_id")
+        workflow_version = detail.get("version")
+        if not workflow_entity_id or not workflow_version:
+            raise RuntimeError(
+                "Workflow '" + target_workflow_name + "' did not return an "
+                "entityId/version from GET /workflow/search -- the Bulk "
+                "Update Workflows API requires both to identify and "
+                "optimistic-lock the workflow being mutated, and this tool "
+                "will not guess at either. Got entity_id="
+                + repr(workflow_entity_id) + ", version=" + repr(workflow_version)
+            )
         existing_by_lower = {
             s["name"].lower(): s for s in detail["statuses"] if s.get("name")
         }
@@ -5190,8 +5241,11 @@ def jira_add_workflow_status(
 
             Args:
                 status_value: Existing status name (already validated present).
-                ref: Caller-chosen reference key correlating this entry to its
-                    use inside the workflow's transitions list.
+                ref: Caller-chosen statusReference correlating this entry to
+                    its use inside the workflow's transitions list. Jira's
+                    validator requires this to be UUID-formatted -- it is
+                    only unique within this one request, never persisted or
+                    looked up, but a non-UUID string is rejected outright.
 
             Returns:
                 Dict with id and statusReference.
@@ -5212,10 +5266,10 @@ def jira_add_workflow_status(
         statuses_payload: List[Dict[str, str]] = []
         transitions_payload: List[Dict[str, Any]] = []
         transitions_added: List[str] = []
-        new_ref = "new-status"
+        new_ref = str(uuid.uuid4())
 
         if insert_after_status:
-            after_ref = "after-status"
+            after_ref = str(uuid.uuid4())
             statuses_payload.append(_status_ref_entry(insert_after_status, after_ref))
             in_name = transition_name_in or status_name
             transitions_payload.append({
@@ -5226,7 +5280,7 @@ def jira_add_workflow_status(
             transitions_added.append(in_name)
 
         if insert_before_status:
-            before_ref = "before-status"
+            before_ref = str(uuid.uuid4())
             statuses_payload.append(_status_ref_entry(insert_before_status, before_ref))
             out_name = transition_name_out or insert_before_status
             transitions_payload.append({
@@ -5246,9 +5300,11 @@ def jira_add_workflow_status(
             "statuses": statuses_payload,
             "workflows": [
                 {
-                    "id": target_workflow_name,
+                    "id": workflow_entity_id,
+                    "version": workflow_version,
                     "statuses": [
-                        {"statusReference": s["statusReference"]} for s in statuses_payload
+                        {"statusReference": s["statusReference"], "properties": {}}
+                        for s in statuses_payload
                     ],
                     "transitions": transitions_payload,
                 }
@@ -5261,14 +5317,13 @@ def jira_add_workflow_status(
             raise RuntimeError(
                 "Jira rejected this workflow update during validation: "
                 + "; ".join(val_errors) + ". This usually means either (a) the "
-                "request payload shape needs adjusting for this Jira "
+                "request payload shape needs further adjusting for this Jira "
                 "instance's current Bulk Workflows API version (see this "
-                "module's header comment -- this schema was not fully "
-                "confirmed against live Atlassian documentation), or (b) the "
-                "workflow cannot be edited in its current state. Check the "
-                "current Atlassian documentation for POST "
-                "/rest/api/3/workflows/update and retry, or ask a Jira admin "
-                "to investigate the workflow's editability."
+                "module's header comment for the 2026-09-08 correction and "
+                "its sources), or (b) the workflow cannot be edited in its "
+                "current state. Check the current Atlassian documentation "
+                "for POST /rest/api/3/workflows/update and retry, or ask a "
+                "Jira admin to investigate the workflow's editability."
             )
 
         result = {

@@ -27,6 +27,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -137,11 +138,32 @@ def _scheme_empty_values():
     return {"values": []}
 
 
-def _workflow_detail(workflow_name="ALGO Workflow"):
+WORKFLOW_ENTITY_ID = "c5ef565c-1b1e-427e-bc3b-e677b0dc027c"
+WORKFLOW_VERSION_ID = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+WORKFLOW_VERSION_NUMBER = 1
+
+
+def _workflow_detail(
+    workflow_name="ALGO Workflow",
+    entity_id=WORKFLOW_ENTITY_ID,
+    version_id=WORKFLOW_VERSION_ID,
+    version_number=WORKFLOW_VERSION_NUMBER,
+):
+    """Build a GET /workflow/search response entry.
+
+    Real Jira Cloud responses for this endpoint carry a top-level "id"
+    (the workflow's entityId, a UUID string -- not its display name) and
+    a "version" object used for optimistic locking, both distinct from
+    "name". jira_add_workflow_status echoes these back unchanged in its
+    mutation payload's workflows[] entry (GitHub issue #10) -- omitting
+    either from this fixture reproduces the exact defect that fix
+    addresses, so both are present by default here.
+    """
     return {
         "values": [
             {
-                "id": {"name": workflow_name},
+                "id": entity_id,
+                "version": {"id": version_id, "versionNumber": version_number},
                 "statuses": [
                     {"id": "1", "name": "To Do"},
                     {"id": "2", "name": "In Progress"},
@@ -166,6 +188,27 @@ def _workflow_detail(workflow_name="ALGO Workflow"):
             }
         ]
     }
+
+
+def _workflow_detail_missing_identity(workflow_name="ALGO Workflow"):
+    """A GET /workflow/search response entry missing "id" and "version".
+
+    Regression fixture for GitHub issue #10: the pre-fix code did not
+    require either field, so a Jira response shaped like this (or a stub
+    server/proxy that omits them) would silently send a broken payload
+    ("id" as a display name, no "version") instead of failing loudly.
+    """
+    detail = _workflow_detail(workflow_name)
+    entry = dict(detail["values"][0])
+    entry.pop("id", None)
+    entry.pop("version", None)
+    return {"values": [entry]}
+
+
+def _decode_request_body(call):
+    """Decode the JSON body of one mocked urlopen call's Request object."""
+    req = call.args[0]
+    return json.loads(req.data.decode("utf-8"))
 
 
 def _validation_ok():
@@ -506,6 +549,81 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["transitions_added"], ["Blocked"])
+
+    @patch("urllib.request.urlopen")
+    def test_validation_payload_carries_entity_id_version_and_uuid_refs(
+        self, mock_urlopen
+    ):
+        """GitHub issue #10 regression: the payload sent to Jira's validation
+        endpoint must identify the workflow by its real entityId + version
+        (not its display name, and not omit version), and every
+        statusReference must be UUID-formatted (not a plain label like
+        "after-status") -- both were the actual cause of the original
+        payload's 400 rejection.
+        """
+        mock_urlopen.side_effect = [
+            _make_resp(_project_algo()),
+            _make_resp(_scheme_not_shared()),
+            _make_resp(_workflow_detail()),
+            _make_resp(_validation_ok()),
+            _make_resp(_update_ok()),
+        ]
+        result = _parse(server.jira_add_workflow_status(
+            project_key="ALGO",
+            status_name="In Review",
+            insert_after_status="In Progress",
+            insert_before_status="Done",
+        ))
+        self.assertTrue(result["success"])
+
+        validate_call = mock_urlopen.call_args_list[3]
+        payload = _decode_request_body(validate_call)
+
+        self.assertEqual(len(payload["workflows"]), 1)
+        workflow_entry = payload["workflows"][0]
+        self.assertEqual(workflow_entry["id"], WORKFLOW_ENTITY_ID)
+        self.assertEqual(
+            workflow_entry["version"],
+            {"id": WORKFLOW_VERSION_ID, "versionNumber": WORKFLOW_VERSION_NUMBER},
+        )
+
+        for status_entry in payload["statuses"]:
+            uuid.UUID(status_entry["statusReference"])  # raises ValueError if not a UUID
+        for status_entry in workflow_entry["statuses"]:
+            uuid.UUID(status_entry["statusReference"])
+        for transition in workflow_entry["transitions"]:
+            for link in transition["links"]:
+                uuid.UUID(link["fromStatusReference"])
+                uuid.UUID(link["toStatusReference"])
+
+    @patch("urllib.request.urlopen")
+    def test_missing_entity_id_or_version_raises_instead_of_guessing(
+        self, mock_urlopen
+    ):
+        """GitHub issue #10 regression: if the workflow-detail fetch cannot
+        produce a real entityId/version, the tool must fail loudly rather
+        than fall back to sending the workflow's display name as "id" (the
+        original defect) or omitting "version" from the payload.
+        """
+        mock_urlopen.side_effect = [
+            _make_resp(_project_algo()),
+            _make_resp(_scheme_not_shared()),
+            _make_resp(_workflow_detail_missing_identity()),
+        ]
+        result = _parse(server.jira_add_workflow_status(
+            project_key="ALGO",
+            status_name="In Review",
+            insert_after_status="In Progress",
+            insert_before_status="Done",
+        ))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "RuntimeError")
+        self.assertIn("entityId/version", result["error"])
+        # Only 3 calls queued: a 4th (the validate call) would raise
+        # StopIteration if the tool proceeded to build/send a payload
+        # despite missing identity fields.
+        self.assertEqual(mock_urlopen.call_count, 3)
 
     def test_idempotency_key_replays_recorded_result(self):
         # The idempotency store defaults to ~/.claude/memory/mcp-idempotency,
