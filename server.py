@@ -5,7 +5,7 @@ Supports both Jira Cloud (v3, ADF format) and Jira Server/Data Center (v2, plain
 Backend: urllib.request (stdlib only, no external deps)
 Transport: stdio
 
-Tools (54):
+Tools (56):
   Core Jira (11):
     jira_create_issue, jira_get_issue, jira_search_issues,
     jira_transition_issue, jira_add_comment, jira_link_pr,
@@ -27,6 +27,8 @@ Tools (54):
     jira_release_notes
   Cross-Board / Multi-Team Metrics (3):
     jira_program_velocity, jira_cross_team_health, jira_dependency_check
+  Workflow Scheme Management (2):
+    jira_get_workflow_info, jira_add_workflow_status
 
 Environment Variables:
   JIRA_URL          - Base URL (e.g. https://company.atlassian.net)
@@ -44,6 +46,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -4567,6 +4570,724 @@ def jira_dependency_check(
         "boards_checked": len(board_ids),
         "boards_with_active_sprint": boards_with_sprint,
     }
+
+
+# ---------------------------------------------------------------------------
+# Workflow Scheme Management Tools (2)
+# ---------------------------------------------------------------------------
+#
+# Jira Cloud separates "which workflow does this project's issue type use"
+# (a workflow scheme, mapping issue types -> workflow names) from "what
+# statuses and transitions does that workflow actually contain" (the workflow
+# itself). A workflow scheme can be shared by more than one project -- Jira
+# defaults new company-managed projects onto a scheme they may not own
+# exclusively -- so editing "the workflow ALGO uses" can silently change what
+# every other project on that same scheme sees. The two tools below treat
+# that sharing as the central risk: jira_get_workflow_info reports it,
+# jira_add_workflow_status refuses to mutate a shared scheme without explicit
+# confirmation. See GitHub issue #9 for the design discussion.
+#
+# The mutation tool targets Jira Cloud's newer JSON-based Bulk Update
+# Workflows API (POST /rest/api/3/workflows/update, preceded by a mandatory
+# call to its /update/validation sibling). That API has changed shape more
+# than once since its introduction, and the exact payload built below is a
+# best-effort reconstruction from Atlassian's public documentation and
+# developer-community reports as of 2026-09-08 -- the full OpenAPI schema
+# could not be retrieved during research. This is why the tool always
+# validates before applying: a schema mismatch surfaces as Jira's own
+# validation error text (see _extract_workflow_validation_errors) rather than
+# as a silent partial mutation of a live workflow.
+
+_STATUS_CATEGORIES = frozenset({"TODO", "IN_PROGRESS", "DONE"})
+_WORKFLOWS_VALIDATE_PATH = "/workflows/update/validation"
+_WORKFLOWS_UPDATE_PATH = "/workflows/update"
+_MAX_SHARED_PROJECT_LOOKUPS = 20
+
+
+def _require_cloud(cfg: Dict[str, str], tool_name: str) -> None:
+    """Raise a clear error when a Cloud-only tool is called against Server/DC.
+
+    Workflow scheme association (``/workflowscheme/project``) and the Bulk
+    Workflows API (``/workflows/update``) are both Jira Cloud (v3) surfaces
+    with no Server/DC (v2) equivalent exposed by this module. Failing loudly
+    here is preferable to letting a v2-configured call reach ``_request`` and
+    fail with a generic 404, which gives no hint that the tool itself is the
+    wrong one for this deployment.
+
+    Args:
+        cfg: Config dict from _get_config().
+        tool_name: Name of the calling tool, for the error message.
+
+    Raises:
+        RuntimeError: If cfg is not configured for Jira Cloud (API version 3).
+    """
+    if not _is_cloud(cfg):
+        raise RuntimeError(
+            tool_name + " requires Jira Cloud (JIRA_API_VERSION=3). Workflow "
+            "scheme association and the Bulk Workflows API used here have no "
+            "Server/Data Center (v2) equivalent exposed by this server."
+        )
+
+
+def _project_id(cfg: Dict[str, str], project_key: str) -> str:
+    """Resolve a project key to its numeric Jira project id.
+
+    The workflow-scheme-association endpoint keys its query on a numeric
+    ``projectId``, not the project key, so every workflow-scheme lookup in
+    this module starts here.
+
+    Args:
+        cfg: Config dict.
+        project_key: Jira project key (e.g. PROJ).
+
+    Returns:
+        The project's numeric id as a string.
+
+    Raises:
+        RuntimeError: If the project cannot be resolved.
+    """
+    result = _request(cfg, "GET", "/project/" + urllib.parse.quote(project_key, safe=""))
+    project_id = (result or {}).get("id")
+    if not project_id:
+        raise RuntimeError("Could not resolve project id for key: " + project_key)
+    return project_id
+
+
+def _workflow_scheme_for_project(cfg: Dict[str, str], project_key: str) -> Dict[str, Any]:
+    """Fetch the workflow scheme associated with one project, with sharing info.
+
+    Uses ``GET /rest/api/3/workflowscheme/project?projectId=X``, which returns
+    the scheme's own ``projectIds`` field -- every project currently
+    associated with that scheme, this project included. That field is the
+    single source of truth this module relies on to answer "is this scheme
+    shared": it comes directly from Jira's own association record rather than
+    being inferred from a separate listing, so there is no window in which a
+    second project could be using the scheme without this call reflecting it.
+
+    Args:
+        cfg: Config dict.
+        project_key: Jira project key.
+
+    Returns:
+        Dict with keys: project_id, workflow_scheme (raw dict as returned by
+        Jira), all_project_ids (every project id sharing this scheme,
+        including project_key's own id), is_shared (True when more than one
+        project id is present).
+
+    Raises:
+        RuntimeError: If no workflow scheme association is returned -- every
+            real, accessible project has exactly one, so an empty result
+            means the project key does not exist or this token lacks
+            Administer Jira permission.
+    """
+    project_id = _project_id(cfg, project_key)
+    result = _request(
+        cfg, "GET",
+        "/workflowscheme/project?projectId=" + urllib.parse.quote(project_id, safe=""),
+    )
+    values = (result or {}).get("values", [])
+    if not values:
+        raise RuntimeError(
+            "No workflow scheme association found for project " + project_key
+            + " (id " + project_id + "). Verify the project key and that this "
+            "token has Administer Jira global permission."
+        )
+    entry = values[0]
+    scheme = entry.get("workflowScheme") or {}
+    all_project_ids = entry.get("projectIds") or [project_id]
+
+    return {
+        "project_id": project_id,
+        "workflow_scheme": scheme,
+        "all_project_ids": all_project_ids,
+        "is_shared": len(all_project_ids) > 1,
+    }
+
+
+def _resolve_project_keys(
+    cfg: Dict[str, str], project_ids: List[str], exclude: str
+) -> List[str]:
+    """Best-effort resolve project ids to human-readable "KEY (name)" strings.
+
+    Capped at ``_MAX_SHARED_PROJECT_LOOKUPS`` so a scheme shared across an
+    unusually large project portfolio cannot turn one safety check into
+    dozens of sequential API calls; the numeric id list in the caller's
+    response is unaffected by the cap.
+
+    Args:
+        cfg: Config dict.
+        project_ids: Numeric project ids to resolve.
+        exclude: A project id to omit from the result (the caller's own project).
+
+    Returns:
+        List of resolved "KEY (name)" strings. A project id whose lookup
+        fails is reported as "id:<id> (lookup failed)" rather than dropped
+        silently, so the caller still sees an accurate count of other
+        projects sharing the scheme even when one lookup errors.
+    """
+    others = [pid for pid in project_ids if pid != exclude][:_MAX_SHARED_PROJECT_LOOKUPS]
+    resolved = []
+    for pid in others:
+        try:
+            proj = _request(cfg, "GET", "/project/" + urllib.parse.quote(pid, safe="")) or {}
+            resolved.append(proj.get("key", "id:" + pid) + " (" + proj.get("name", "") + ")")
+        except Exception:
+            resolved.append("id:" + pid + " (lookup failed)")
+    return resolved
+
+
+def _workflow_names_in_scheme(scheme: Dict[str, Any]) -> List[str]:
+    """Return every distinct workflow name a workflow scheme references.
+
+    Args:
+        scheme: Raw workflowScheme dict from the workflow-scheme-association API.
+
+    Returns:
+        Sorted list of unique workflow names: the scheme's default workflow
+        plus every issue-type-specific mapping.
+    """
+    names = set()
+    default_wf = scheme.get("defaultWorkflow")
+    if default_wf:
+        names.add(default_wf)
+    for wf_name in (scheme.get("issueTypeMappings") or {}).values():
+        if wf_name:
+            names.add(wf_name)
+    return sorted(names)
+
+
+def _fetch_workflow_detail(cfg: Dict[str, str], workflow_name: str) -> Dict[str, Any]:
+    """Fetch one workflow's current statuses and transitions.
+
+    Uses ``GET /rest/api/3/workflow/search``, the read-only workflow
+    inspection endpoint. This endpoint is independent of the newer
+    JSON-based Bulk Workflows API used for mutation below, so a schema
+    change in the mutation API does not affect this read path.
+
+    Args:
+        cfg: Config dict.
+        workflow_name: Exact workflow name.
+
+    Returns:
+        Dict with keys: name, statuses (list of {id, name}), transitions
+        (list of {id, name, from (list of status names), to, type}).
+
+    Raises:
+        RuntimeError: If Jira returns no workflow with this name.
+    """
+    result = _request(
+        cfg, "GET",
+        "/workflow/search?workflowName=" + urllib.parse.quote(workflow_name, safe="")
+        + "&expand=transitions,statuses",
+    )
+    values = (result or {}).get("values", [])
+    if not values:
+        raise RuntimeError("Workflow not found: " + workflow_name)
+    wf = values[0]
+
+    statuses = [
+        {"id": s.get("id"), "name": s.get("name")}
+        for s in (wf.get("statuses") or [])
+    ]
+
+    def _from_names(raw_from: Any) -> List[str]:
+        """Normalize a transition's 'from' field to a list of status names."""
+        items = raw_from if isinstance(raw_from, list) else [raw_from]
+        return [f.get("name") if isinstance(f, dict) else f for f in items if f]
+
+    def _to_name(raw_to: Any) -> Optional[str]:
+        """Normalize a transition's 'to' field to a status name."""
+        if isinstance(raw_to, dict):
+            return raw_to.get("name")
+        return raw_to
+
+    transitions = [
+        {
+            "id": t.get("id"),
+            "name": t.get("name"),
+            "from": _from_names(t.get("from")),
+            "to": _to_name(t.get("to")),
+            "type": t.get("type"),
+        }
+        for t in (wf.get("transitions") or [])
+    ]
+    return {"name": workflow_name, "statuses": statuses, "transitions": transitions}
+
+
+def _resolve_status_id(cfg: Dict[str, str], status_name: str) -> Optional[str]:
+    """Resolve a status name to its global Jira status id.
+
+    Uses ``GET /rest/api/3/statuses/search``, the general-purpose status
+    lookup endpoint, as a fallback when a status returned by
+    ``_fetch_workflow_detail`` did not carry an ``id`` field. Matching is
+    exact and case-insensitive; the first match is used.
+
+    Args:
+        cfg: Config dict.
+        status_name: Exact status name to resolve.
+
+    Returns:
+        The status id as a string, or None if no exact match was found.
+    """
+    result = _request(
+        cfg, "GET",
+        "/statuses/search?searchString=" + urllib.parse.quote(status_name, safe=""),
+    )
+    for s in (result or {}).get("values", []):
+        if (s.get("name") or "").lower() == status_name.lower():
+            return s.get("id")
+    return None
+
+
+def _extract_workflow_validation_errors(validation: Any) -> List[str]:
+    """Pull human-readable error strings out of a Bulk Workflows API response.
+
+    The validation and update endpoints return errors embedded in a 200
+    response body rather than always via HTTP status (consistent with other
+    Jira Cloud bulk-operation APIs), and the exact shape of that body is one
+    of the unconfirmed details noted in this module's header comment. This
+    function is deliberately defensive: it tries several known-plausible
+    shapes (a top-level errorMessages/errors dict, a flat list of error
+    objects, per-workflow nested errors) and returns whatever it can find
+    rather than raising on an unexpected shape, so an unfamiliar response
+    still surfaces as much detail as possible instead of a bare KeyError.
+
+    Args:
+        validation: Parsed JSON response from the validate or update endpoint.
+
+    Returns:
+        List of error message strings. Empty when no errors were found in
+        any of the recognized shapes.
+    """
+    if not validation:
+        return []
+
+    errors: List[str] = []
+
+    if isinstance(validation, list):
+        for item in validation:
+            if isinstance(item, dict):
+                errors.append(item.get("message") or item.get("errorMessage") or str(item))
+            elif item:
+                errors.append(str(item))
+        return errors
+
+    if isinstance(validation, dict):
+        errors.extend(validation.get("errorMessages") or [])
+        for e in (validation.get("errors") or []):
+            errors.append(e.get("message") if isinstance(e, dict) else str(e))
+        for wf in (validation.get("workflows") or []):
+            if not isinstance(wf, dict):
+                continue
+            for e in (wf.get("errors") or []):
+                errors.append(e.get("message") if isinstance(e, dict) else str(e))
+
+    return errors
+
+
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
+@mcp_tool_handler
+def jira_get_workflow_info(project_key: str) -> dict:
+    """Report a project's workflow scheme, its workflows, and whether the scheme is shared.
+
+    This is the read-only companion to ``jira_add_workflow_status`` and exists
+    specifically to answer the question that tool refuses to guess at: does
+    this project have exclusive use of its workflow scheme, or would editing
+    it also change what other projects see? A workflow scheme in Jira Cloud
+    is not scoped to one project by default -- company-managed projects can,
+    and often do, share one -- so "the workflow ALGO uses" may really mean
+    "the workflow ALGO, FAB and SCRUM all use". Call this before
+    ``jira_add_workflow_status`` to see that exposure up front rather than
+    discovering it from a refusal.
+
+    Args:
+        project_key: Jira project key (e.g. ALGO).
+
+    Returns:
+        Dict with keys: project_key, project_id, workflow_scheme_id,
+        workflow_scheme_name, is_shared, shared_with_project_count,
+        shared_with_projects (list of "KEY (name)" strings, best-effort,
+        capped), workflow_names (every workflow this scheme maps an issue
+        type to), workflows (list of {name, statuses, transitions} per
+        workflow), and workflow_detail_errors (present only when fetching one
+        workflow's detail failed -- the scheme-level and sharing information
+        above is still returned in that case, since the safety-critical part
+        of this tool does not depend on workflow detail succeeding).
+
+    Raises:
+        RuntimeError: If Jira Cloud is not configured, or the project cannot
+            be resolved (see _workflow_scheme_for_project).
+    """
+    cfg = _get_config()
+    _require_cloud(cfg, "jira_get_workflow_info")
+    project_key = validate_input(project_key, max_length=10, field_name="project_key")
+
+    scheme_info = _workflow_scheme_for_project(cfg, project_key)
+    scheme = scheme_info["workflow_scheme"]
+    workflow_names = _workflow_names_in_scheme(scheme)
+
+    workflows = []
+    detail_errors = []
+    for name in workflow_names:
+        try:
+            workflows.append(_fetch_workflow_detail(cfg, name))
+        except Exception as e:
+            detail_errors.append({"workflow_name": name, "error": str(e) or type(e).__name__})
+
+    shared_with: List[str] = []
+    if scheme_info["is_shared"]:
+        shared_with = _resolve_project_keys(
+            cfg, scheme_info["all_project_ids"], exclude=scheme_info["project_id"]
+        )
+
+    result: Dict[str, Any] = {
+        "project_key": project_key,
+        "project_id": scheme_info["project_id"],
+        "workflow_scheme_id": scheme.get("id"),
+        "workflow_scheme_name": scheme.get("name", ""),
+        "is_shared": scheme_info["is_shared"],
+        "shared_with_project_count": max(len(scheme_info["all_project_ids"]) - 1, 0),
+        "shared_with_projects": shared_with,
+        "workflow_names": workflow_names,
+        "workflows": workflows,
+    }
+    if detail_errors:
+        result["workflow_detail_errors"] = detail_errors
+    if scheme_info["is_shared"]:
+        result["safety_note"] = (
+            "This workflow scheme is shared with " + str(result["shared_with_project_count"])
+            + " other project(s). jira_add_workflow_status refuses to mutate it "
+            "unless called with confirm_shared_scheme_edit=True, because editing a "
+            "workflow scheme is not scoped to one project -- it changes what every "
+            "project on this scheme sees."
+        )
+    return result
+
+
+@_tool(read_only=False, destructive=True, idempotent=False, open_world=True)
+@mcp_tool_handler
+def jira_add_workflow_status(
+    project_key: str,
+    status_name: str,
+    insert_after_status: Optional[str] = None,
+    insert_before_status: Optional[str] = None,
+    status_category: str = "IN_PROGRESS",
+    workflow_name: Optional[str] = None,
+    transition_name_in: Optional[str] = None,
+    transition_name_out: Optional[str] = None,
+    confirm_shared_scheme_edit: bool = False,
+    validate_only: bool = False,
+    idempotency_key: Optional[str] = None,
+) -> dict:
+    """Add a new status to a project's workflow, positioned between two existing statuses.
+
+    Adds ``status_name`` to the workflow and wires it in with new transitions:
+    ``insert_after_status -> status_name`` (named ``transition_name_in``, default
+    ``status_name``) and ``status_name -> insert_before_status`` (named
+    ``transition_name_out``, default ``insert_before_status``). At least one of
+    ``insert_after_status`` / ``insert_before_status`` is required; passing only
+    one adds the status as a dead end or an entry point rather than fully
+    between two states, which is a legitimate use (e.g. inserting before a
+    single terminal "Done" with no defined predecessor to link from).
+
+    Uses Jira Cloud's Bulk Update Workflows API. Call ``jira_get_workflow_info``
+    first if you have not already -- everything below depends on it.
+
+    SAFETY: shared workflow schemes. A workflow scheme is not scoped to one
+    project; company-managed projects on the same Jira site commonly share
+    one. This tool looks up every project associated with ``project_key``'s
+    scheme (the same check ``jira_get_workflow_info`` reports) and refuses to
+    mutate it when more than one project is found, unless
+    ``confirm_shared_scheme_edit=True`` is passed explicitly. This mirrors the
+    fail-safe-on-ambiguity design of ``github_merge_pr`` in the sibling
+    mcp-github-api server: a tool asked to change one project's workflow must
+    never silently change another project's workflow as a side effect, and
+    the caller -- not a default -- decides when that risk is acceptable.
+
+    SAFETY: ambiguous target workflow. If the scheme maps different issue
+    types to more than one distinct workflow, ``workflow_name`` must be
+    passed explicitly; otherwise this tool refuses rather than guessing which
+    workflow to mutate.
+
+    SAFETY: validate before apply. The payload is always submitted to
+    ``POST /rest/api/3/workflows/update/validation`` first. Only when that
+    validation reports no errors is ``POST /rest/api/3/workflows/update``
+    called to apply it (skipped entirely when ``validate_only=True``). Jira's
+    own validation error text is surfaced verbatim in the raised exception --
+    this tool does not attempt to interpret or paper over a rejected payload,
+    because the exact request schema for this API has changed more than once
+    (see this module's header comment) and a wrong guess should fail loudly,
+    not silently apply something else.
+
+    This operation is not idempotent -- adding the same status twice is
+    rejected by Jira as a duplicate name, so a retry is not simply harmless,
+    it is actively different work (Jira's error) from the first call's
+    outcome. Supply ``idempotency_key`` -- generated once per logical intent
+    and reused unchanged on every retry of that same decision -- so a repeat
+    call after a lost response replays the recorded result instead of
+    re-attempting against a workflow that has already changed.
+
+    Args:
+        project_key: Jira project key (e.g. ALGO).
+        status_name: Name of the new status to add (e.g. "In Review"). Must
+            not already exist in the target workflow.
+        insert_after_status: Existing status name the new status follows
+            (e.g. "In Progress"). A transition from this status to the new
+            one is added. At least one of insert_after_status /
+            insert_before_status is required.
+        insert_before_status: Existing status name the new status precedes
+            (e.g. "Done"). A transition from the new status to this one is
+            added. At least one of insert_after_status / insert_before_status
+            is required.
+        status_category: One of "TODO", "IN_PROGRESS", "DONE". Default
+            "IN_PROGRESS", the correct category for a mid-workflow review
+            state.
+        workflow_name: Exact workflow name to mutate. Required only when the
+            project's workflow scheme maps different issue types to more
+            than one distinct workflow; otherwise the scheme's single
+            workflow is used automatically.
+        transition_name_in: Name for the insert_after_status -> status_name
+            transition. Defaults to status_name.
+        transition_name_out: Name for the status_name -> insert_before_status
+            transition. Defaults to insert_before_status.
+        confirm_shared_scheme_edit: Must be True to proceed when the target
+            workflow scheme is shared with any other project. False (the
+            default) refuses with the list of affected projects instead of
+            mutating a scheme those projects also depend on.
+        validate_only: When True, submits the payload to Jira's validation
+            endpoint and returns its verdict without applying the change.
+            Useful for checking a payload against a live Jira instance
+            before committing to the mutation.
+        idempotency_key: Optional caller-generated key scoped to one logical
+            add-status intent.
+
+    Returns:
+        Dict with keys: project_key, workflow_name, status_name,
+        status_category, transitions_added (list of transition names
+        actually included in the payload), validated (True once validation
+        passed), applied (True once the mutation was submitted; False when
+        validate_only=True).
+
+    Raises:
+        RuntimeError: If Jira Cloud is not configured, the project/workflow
+            cannot be resolved, or Jira's validation endpoint reports errors
+            for the constructed payload.
+        ValueError: If status_category is not recognized, neither
+            insert_after_status nor insert_before_status is given,
+            status_name already exists in the target workflow, or
+            insert_after_status/insert_before_status does not match an
+            existing status in the target workflow.
+    """
+    cfg = _get_config()
+    _require_cloud(cfg, "jira_add_workflow_status")
+
+    project_key = validate_input(project_key, max_length=10, field_name="project_key")
+    status_name = validate_input(status_name, max_length=60, field_name="status_name")
+    if status_category not in _STATUS_CATEGORIES:
+        raise ValueError(
+            "status_category must be one of " + ", ".join(sorted(_STATUS_CATEGORIES))
+            + ", got: " + status_category
+        )
+    if not insert_after_status and not insert_before_status:
+        raise ValueError(
+            "At least one of insert_after_status or insert_before_status is "
+            "required -- the new status must be wired into the workflow "
+            "somewhere, not left unreachable."
+        )
+
+    def _run() -> dict:
+        """Look up scheme/workflow state, apply every safety gate, then mutate.
+
+        Everything that depends on live Jira state -- the shared-scheme and
+        ambiguous-workflow safety checks, the duplicate-status and
+        insert-point-existence checks, and the mutation itself -- lives in
+        this closure so it runs at most once per idempotency_key. This is not
+        just about avoiding redundant API calls: the duplicate-status check
+        below is exactly the check a successful first call causes to start
+        failing on a second call, since the status now really does exist. If
+        that check ran outside the run_once boundary, a caller retrying after
+        a lost response -- the situation idempotency_key exists to handle --
+        would get a spurious "status already exists" error instead of the
+        cached success, on the one operation this module protects most
+        deliberately.
+        """
+        scheme_info = _workflow_scheme_for_project(cfg, project_key)
+        scheme = scheme_info["workflow_scheme"]
+
+        if scheme_info["is_shared"] and not confirm_shared_scheme_edit:
+            shared_with = _resolve_project_keys(
+                cfg, scheme_info["all_project_ids"], exclude=scheme_info["project_id"]
+            )
+            return {
+                "success": False,
+                "error": (
+                    "Refusing to edit workflow scheme '" + scheme.get("name", "")
+                    + "' (id " + str(scheme.get("id", "")) + "): it is shared "
+                    "with " + str(len(shared_with)) + " other project(s): "
+                    + ", ".join(shared_with) + ". Adding a status here would "
+                    "change the workflow those projects see too, not just "
+                    + project_key + ". Re-run with "
+                    "confirm_shared_scheme_edit=True only after confirming "
+                    "this change is intended for all of them."
+                ),
+                "error_type": "SHARED_WORKFLOW_SCHEME_REFUSED",
+                "project_key": project_key,
+                "workflow_scheme_id": scheme.get("id"),
+                "workflow_scheme_name": scheme.get("name", ""),
+                "shared_with_projects": shared_with,
+            }
+
+        available_workflow_names = _workflow_names_in_scheme(scheme)
+        if workflow_name:
+            if workflow_name not in available_workflow_names:
+                raise ValueError(
+                    "workflow_name '" + workflow_name + "' is not used by project "
+                    + project_key + "'s workflow scheme. Available: "
+                    + ", ".join(available_workflow_names)
+                )
+            target_workflow_name = workflow_name
+        elif len(available_workflow_names) > 1:
+            return {
+                "success": False,
+                "error": (
+                    "Project " + project_key + "'s workflow scheme maps "
+                    "different issue types to more than one workflow, so "
+                    "which one to mutate is ambiguous. Pass workflow_name "
+                    "explicitly."
+                ),
+                "error_type": "AMBIGUOUS_WORKFLOW",
+                "project_key": project_key,
+                "available_workflow_names": available_workflow_names,
+            }
+        else:
+            target_workflow_name = available_workflow_names[0]
+
+        detail = _fetch_workflow_detail(cfg, target_workflow_name)
+        existing_by_lower = {
+            s["name"].lower(): s for s in detail["statuses"] if s.get("name")
+        }
+
+        if status_name.lower() in existing_by_lower:
+            raise ValueError(
+                "Status '" + status_name + "' already exists in workflow '"
+                + target_workflow_name + "'. Use jira_get_transitions / the "
+                "existing transitions rather than adding a duplicate status."
+            )
+
+        for label, value in (
+            ("insert_after_status", insert_after_status),
+            ("insert_before_status", insert_before_status),
+        ):
+            if value and value.lower() not in existing_by_lower:
+                raise ValueError(
+                    label + "='" + value + "' was not found in workflow '"
+                    + target_workflow_name + "'. Existing statuses: "
+                    + ", ".join(s["name"] for s in detail["statuses"])
+                )
+
+        def _status_ref_entry(status_value: str, ref: str) -> Dict[str, str]:
+            """Build one existing-status entry for the bulk-update payload.
+
+            Args:
+                status_value: Existing status name (already validated present).
+                ref: Caller-chosen reference key correlating this entry to its
+                    use inside the workflow's transitions list.
+
+            Returns:
+                Dict with id and statusReference.
+
+            Raises:
+                RuntimeError: If the status has no id from the workflow detail
+                    fetch and the statuses/search fallback also fails to
+                    resolve one.
+            """
+            existing = existing_by_lower[status_value.lower()]
+            status_id = existing.get("id") or _resolve_status_id(cfg, status_value)
+            if not status_id:
+                raise RuntimeError(
+                    "Could not resolve a Jira status id for '" + status_value + "'."
+                )
+            return {"id": status_id, "statusReference": ref}
+
+        statuses_payload: List[Dict[str, str]] = []
+        transitions_payload: List[Dict[str, Any]] = []
+        transitions_added: List[str] = []
+        new_ref = "new-status"
+
+        if insert_after_status:
+            after_ref = "after-status"
+            statuses_payload.append(_status_ref_entry(insert_after_status, after_ref))
+            in_name = transition_name_in or status_name
+            transitions_payload.append({
+                "name": in_name,
+                "type": "DIRECTED",
+                "links": [{"fromStatusReference": after_ref, "toStatusReference": new_ref}],
+            })
+            transitions_added.append(in_name)
+
+        if insert_before_status:
+            before_ref = "before-status"
+            statuses_payload.append(_status_ref_entry(insert_before_status, before_ref))
+            out_name = transition_name_out or insert_before_status
+            transitions_payload.append({
+                "name": out_name,
+                "type": "DIRECTED",
+                "links": [{"fromStatusReference": new_ref, "toStatusReference": before_ref}],
+            })
+            transitions_added.append(out_name)
+
+        statuses_payload.append({
+            "name": status_name,
+            "statusCategory": status_category,
+            "statusReference": new_ref,
+        })
+
+        payload = {
+            "statuses": statuses_payload,
+            "workflows": [
+                {
+                    "id": target_workflow_name,
+                    "statuses": [
+                        {"statusReference": s["statusReference"]} for s in statuses_payload
+                    ],
+                    "transitions": transitions_payload,
+                }
+            ],
+        }
+
+        validation = _request(cfg, "POST", _WORKFLOWS_VALIDATE_PATH, payload)
+        val_errors = _extract_workflow_validation_errors(validation)
+        if val_errors:
+            raise RuntimeError(
+                "Jira rejected this workflow update during validation: "
+                + "; ".join(val_errors) + ". This usually means either (a) the "
+                "request payload shape needs adjusting for this Jira "
+                "instance's current Bulk Workflows API version (see this "
+                "module's header comment -- this schema was not fully "
+                "confirmed against live Atlassian documentation), or (b) the "
+                "workflow cannot be edited in its current state. Check the "
+                "current Atlassian documentation for POST "
+                "/rest/api/3/workflows/update and retry, or ask a Jira admin "
+                "to investigate the workflow's editability."
+            )
+
+        result = {
+            "project_key": project_key,
+            "workflow_name": target_workflow_name,
+            "status_name": status_name,
+            "status_category": status_category,
+            "transitions_added": transitions_added,
+            "validated": True,
+            "applied": False,
+        }
+        if validate_only:
+            return result
+
+        _request(cfg, "POST", _WORKFLOWS_UPDATE_PATH, payload)
+        result["applied"] = True
+        return result
+
+    return run_once("jira_add_workflow_status", idempotency_key, _run)
 
 
 if __name__ == "__main__":
