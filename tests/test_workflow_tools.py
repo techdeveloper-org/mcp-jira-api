@@ -671,15 +671,24 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
                 uuid.UUID(link["fromStatusReference"])
 
     @patch("urllib.request.urlopen")
-    def test_transitions_carry_uuid_id_field(self, mock_urlopen):
-        """GitHub issue #10 round 4 regression: TransitionUpdateDTO's "id" is
-        a caller-supplied local reference for a transition, the same role
-        statusReference plays for statuses -- confirmed by both the
-        workflows/update and workflows/create examples in swagger-v3.v3.json
-        carrying one on every transition entry, including ones inside a
-        brand-new workflow that has no pre-existing Jira transition id.
-        Omitting it (the pre-fix payload) is rejected by live Jira validation
-        with "Missing required field ...transitions.[0].id".
+    def test_new_transitions_omit_id_field(self, mock_urlopen):
+        """GitHub issue #10 round 5 regression: round 4's premise -- that
+        TransitionUpdateDTO's "id" plays the same caller-supplied local
+        reference role that WorkflowStatusUpdate's "statusReference" plays
+        for statuses -- was wrong. TransitionUpdateDTO has no separate
+        reference field at all; "id" is its ONLY identifier, and
+        WorkflowStatusUpdate's own schema description for "id" confirms the
+        role such a field plays across this API: "the ID of the status. When
+        reusing an existing status, this field should be provided." A new
+        transition has no pre-existing Jira id to reuse, so "id" must be
+        omitted entirely -- a new transition is already fully identified by
+        its toStatusReference and links[].fromStatusReference, both of which
+        point at statusReference values. Sending a client-generated uuid4()
+        as "id" (round 4's fix) made live Jira validation try to resolve it
+        as a reference to an already-existing transition (whose real ids are
+        small integer strings, per this endpoint's own swagger example) and
+        reject it with "payload.workflows[0].transitions[0].id.value :
+        Invalid format".
         """
         mock_urlopen.side_effect = [
             _make_resp(_project_algo()),
@@ -703,13 +712,8 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
         transitions = envelope["payload"]["workflows"][0]["transitions"]
 
         self.assertEqual(len(transitions), 2)
-        ids = set()
         for transition in transitions:
-            self.assertIn("id", transition)
-            uuid.UUID(transition["id"])  # raises ValueError if not a UUID
-            ids.add(transition["id"])
-        # Each transition gets its own distinct local reference id.
-        self.assertEqual(len(ids), 2)
+            self.assertNotIn("id", transition)
 
     @patch("urllib.request.urlopen")
     def test_missing_entity_id_or_version_raises_instead_of_guessing(

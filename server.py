@@ -4647,6 +4647,26 @@ def jira_dependency_check(
 # transition entry, mirroring the existing statusReference/after_ref/
 # before_ref pattern.
 #
+# Round 5 (live-tested against real project ALGO once round 4's fix was
+# live; validate_only=True returned "payload.workflows[0].transitions[0].id
+# .value : Invalid format" for every transition): round 4's premise was
+# wrong. TransitionUpdateDTO has no separate reference field the way
+# WorkflowStatusUpdate has both "id" (existing) and "statusReference" (new
+# or existing, caller-chosen correlation value) -- for transitions, "id" is
+# the ONLY identifier field, and WorkflowStatusUpdate's own schema
+# description confirms the role such an "id" field plays across this API:
+# "the ID of the status. When reusing an existing status, this field should
+# be provided." There is no equivalent of statusReference for transitions
+# because none is needed -- a new transition is already fully identified by
+# its toStatusReference and links[].fromStatusReference, both of which point
+# at statusReference values. Sending a client-generated uuid4() as a
+# transition's "id" made Jira try to resolve it as a reference to an
+# already-existing transition (whose real ids are small integer strings --
+# see the "1"/"11"/"21"/"31" ids in this endpoint's own swagger example --
+# not UUIDs), which is what "Invalid format" meant. The fix omits "id"
+# entirely from new transition entries; Jira assigns the real id once the
+# transition is created.
+#
 # This is why the tool always validates before applying: a remaining schema
 # mismatch surfaces as Jira's own validation error text (see
 # _extract_workflow_validation_errors, which now also filters WARNING-level
@@ -5372,7 +5392,6 @@ def jira_add_workflow_status(
             statuses_payload.append(_status_ref_entry(insert_after_status, after_ref))
             in_name = transition_name_in or status_name
             transitions_payload.append({
-                "id": str(uuid.uuid4()),
                 "name": in_name,
                 "type": "DIRECTED",
                 "toStatusReference": new_ref,
@@ -5385,7 +5404,6 @@ def jira_add_workflow_status(
             statuses_payload.append(_status_ref_entry(insert_before_status, before_ref))
             out_name = transition_name_out or insert_before_status
             transitions_payload.append({
-                "id": str(uuid.uuid4()),
                 "name": out_name,
                 "type": "DIRECTED",
                 "toStatusReference": before_ref,
