@@ -4590,39 +4590,69 @@ def jira_dependency_check(
 #
 # The mutation tool targets Jira Cloud's newer JSON-based Bulk Update
 # Workflows API (POST /rest/api/3/workflows/update, preceded by a mandatory
-# call to its /update/validation sibling). That API has changed shape more
-# than once since its introduction, and its full OpenAPI schema could not be
-# retrieved during research (the swagger-v3.v3.json spec document is too
-# large to fetch/search in full through available tooling). The payload
-# below was corrected on 2026-09-08 (GitHub issue #10) after a first
-# best-effort attempt was rejected by Jira's own validation endpoint with a
-# generic 400. The correction is cross-referenced across Atlassian support
-# docs and multiple independent Atlassian Developer Community threads
-# (including one quoting a real payload an Atlassian staff member confirmed
-# worked) rather than a single source, and fixes two concrete defects in the
-# first attempt:
-#   1. workflows[].id must be the workflow's real entityId (a UUID, read
-#      back from GET /workflow/search's own top-level "id" field) plus a
-#      "version" object ({"id", "versionNumber"}, also from that same GET
-#      response) for optimistic locking. The first attempt sent the
-#      workflow's display *name* as "id" and omitted "version" entirely.
-#   2. Every statusReference value must itself be UUID-formatted -- it is
-#      only a same-request correlation key, never persisted or looked up,
-#      but Jira's validator rejects a non-UUID string outright. The first
-#      attempt used plain labels ("after-status", "new-status", etc).
-# This correction is NOT yet confirmed by a live validate_only=True call
-# against a real Jira instance: the fix was made by editing this file's
-# already-running MCP server process in place, and that process does not
-# reload edited source (confirmed by adding then querying for a canary
-# field that never appeared in a live jira_get_workflow_info response
-# after the edit) -- so the next real call through a freshly (re)started
-# jira-api MCP connection is the first one that will actually exercise
-# this code. Run jira_add_workflow_status with validate_only=True first
-# and confirm it returns a clean validated=True before ever omitting
-# validate_only. This is why the tool always validates before applying: a
-# remaining schema mismatch surfaces as Jira's own validation error text
-# (see _extract_workflow_validation_errors) rather than as a silent
-# partial mutation of a live workflow.
+# call to its /update/validation sibling). Three rounds of real defects were
+# found and fixed here across 2026-09-08 (GitHub issue #10):
+#
+# Round 1 (cross-referenced from Atlassian support docs and community
+# threads, not yet schema-confirmed): workflows[].id must be the workflow's
+# real entityId (a UUID), plus a "version" object ({"id", "versionNumber"})
+# for optimistic locking -- the first attempt sent the workflow's display
+# *name* as "id" and omitted "version" entirely. Every statusReference value
+# must itself be UUID-formatted -- the first attempt used plain labels
+# ("after-status", "new-status", etc), which Jira's validator rejects.
+#
+# Round 2 (live-tested against real project ALGO once the MCP server was
+# restarted to pick up round 1's fix): entityId now resolved correctly, but
+# version still came back None. Root cause: _fetch_workflow_detail was
+# calling GET /rest/api/3/workflow/search (singular) -- the OLDER
+# classic-workflow read endpoint, whose "Workflow" response schema has NO
+# version field at all (it exposes operations.canEdit/canDelete instead) and
+# whose "id" is a {"name", "entityId"} object, not a plain string. The
+# correct read endpoint is GET /rest/api/3/workflows/search (PLURAL), whose
+# "JiraWorkflow" response schema is the one that actually matches the
+# mutation payload: "id" is a plain entityId string, "version" is the real
+# {"id", "versionNumber"} object, and it additionally reports "isEditable".
+#
+# Round 3 (found by downloading and locally parsing the full
+# swagger-v3.v3.json spec with plain Python+curl -- previously reported as
+# "too large to fetch/search in full through available tooling", which was
+# true only of the summarizing web-fetch tool used at the time, not of the
+# document itself) surfaced two more defects that round 1's live test had
+# not yet reached:
+#   1. The top-level statuses[] payload entries require "name" and
+#      "statusCategory" on every entry per the WorkflowStatusUpdate schema
+#      -- including ones reusing an existing status by "id". The first two
+#      rounds sent only {"id", "statusReference"} for reused statuses.
+#   2. TransitionUpdateDTO's "toStatusReference" is a field on the
+#      transition itself, not inside each links[] entry -- and
+#      WorkflowTransitionLinks (additionalProperties: false) only accepts
+#      fromStatusReference/fromPort/toPort, so a "toStatusReference" nested
+#      inside links[] is simply an unrecognized property there.
+#   3. POST /workflows/update/validation's request body is a
+#      WorkflowUpdateValidateRequestBean -- {"payload": <the actual
+#      WorkflowUpdateRequest>} -- not the WorkflowUpdateRequest directly.
+#      POST /workflows/update (the real mutation) takes it unwrapped. Only
+#      the validation call needs the extra "payload" wrapper.
+# Round 4 (live-tested against real project ALGO once round 3's fix was
+# live; validate_only=True returned a specific error instead of a generic
+# 400): "Missing required field 'payload.workflows.[0].transitions.[0].id'".
+# TransitionUpdateDTO's "id" is a plain string with no format constraint in
+# the schema, but both the workflows/update AND workflows/create examples in
+# swagger-v3.v3.json show every transition entry carrying one -- including
+# ones inside a brand-new workflow that has never existed in Jira, where no
+# real Jira-assigned transition id could exist yet. That confirms "id" is a
+# caller-supplied local reference for a transition, the same role
+# statusReference plays for statuses, not something only valid when reusing
+# an existing transition. The fix supplies a fresh uuid.uuid4() per new
+# transition entry, mirroring the existing statusReference/after_ref/
+# before_ref pattern.
+#
+# This is why the tool always validates before applying: a remaining schema
+# mismatch surfaces as Jira's own validation error text (see
+# _extract_workflow_validation_errors, which now also filters WARNING-level
+# entries -- confirmed non-blocking per the same schema -- so a clean
+# payload cannot be rejected for a warning) rather than as a silent partial
+# mutation of a live workflow.
 
 _STATUS_CATEGORIES = frozenset({"TODO", "IN_PROGRESS", "DONE"})
 _WORKFLOWS_VALIDATE_PATH = "/workflows/update/validation"
@@ -4785,16 +4815,22 @@ def _workflow_names_in_scheme(scheme: Dict[str, Any]) -> List[str]:
 def _fetch_workflow_detail(cfg: Dict[str, str], workflow_name: str) -> Dict[str, Any]:
     """Fetch one workflow's current identity, statuses, and transitions.
 
-    Uses ``GET /rest/api/3/workflow/search``, the read-only workflow
-    inspection endpoint for the same JSON-based Workflows API the Bulk
-    Update Workflows mutation endpoint operates on. Unlike the older
-    classic-workflow APIs, this endpoint's response shape mirrors the
-    mutation request shape by design: each entry carries a top-level
-    ``id`` (the workflow's entityId, a UUID -- not its display name) and
-    a ``version`` object (``{"id": ..., "versionNumber": ...}``) used for
-    optimistic locking on update. Both are captured here because
-    ``jira_add_workflow_status`` must echo them back unchanged in its
-    mutation payload's ``workflows[]`` entry.
+    Uses ``GET /rest/api/3/workflows/search`` (plural -- not the older,
+    singular ``/rest/api/3/workflow/search``) filtered by ``queryString``.
+    This distinction matters: the two endpoints return different schemas.
+    The singular endpoint's ``Workflow`` schema has no ``version`` field at
+    all (it exposes ``operations.canEdit``/``canDelete`` instead) and its
+    ``id`` is a ``{"name": ..., "entityId": ...}`` object -- discovered live
+    against project ALGO on 2026-09-08 (GitHub #10) after the first fix
+    correctly pulled ``entityId`` out of that nested object but the ``version``
+    it was also expected to carry there simply does not exist on that schema,
+    for any workflow. The plural endpoint's ``JiraWorkflow`` schema is the one
+    that actually matches the Bulk Update Workflows API's mutation payload:
+    ``id`` is a plain entityId string and ``version`` is the
+    ``{"id": ..., "versionNumber": ...}`` object required for optimistic
+    locking, confirmed against the same live ALGO workflow (a real
+    ``versionNumber: 0`` came back, not None). It also reports ``isEditable``,
+    which the singular endpoint never populated for this workflow either.
 
     Args:
         cfg: Config dict.
@@ -4802,45 +4838,84 @@ def _fetch_workflow_detail(cfg: Dict[str, str], workflow_name: str) -> Dict[str,
 
     Returns:
         Dict with keys: name, entity_id (the workflow's UUID, or None if
-        the response did not carry one), version (the raw version dict,
-        or None), statuses (list of {id, name}), transitions (list of
-        {id, name, from (list of status names), to, type}).
+        the response did not carry one), version (the raw
+        ``{"id", "versionNumber"}`` dict, or None), is_editable (bool, or
+        None if the response omitted it), statuses (list of {id, name}),
+        transitions (list of {id, name, from (list of status names), to,
+        type}).
 
     Raises:
-        RuntimeError: If Jira returns no workflow with this name.
+        RuntimeError: If Jira returns no workflow matching this name, or
+            more than one (workflow names are expected to be unique
+            site-wide; an ambiguous match is refused rather than guessing
+            which one the caller meant).
     """
     result = _request(
         cfg, "GET",
-        "/workflow/search?workflowName=" + urllib.parse.quote(workflow_name, safe="")
-        + "&expand=transitions,statuses",
+        "/workflows/search?queryString=" + urllib.parse.quote(workflow_name, safe="")
+        + "&expand=values.transitions",
     )
     values = (result or {}).get("values", [])
-    if not values:
+    matches = [
+        v for v in values if (v.get("name") or "").lower() == workflow_name.lower()
+    ]
+    if not matches:
         raise RuntimeError("Workflow not found: " + workflow_name)
-    wf = values[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Ambiguous workflow name '" + workflow_name + "' matched "
+            + str(len(matches)) + " workflows. Workflow names are expected "
+            "to be unique site-wide; this needs manual investigation."
+        )
+    wf = matches[0]
+
+    status_catalog = {
+        s.get("id"): s
+        for s in (result or {}).get("statuses", [])
+        if s.get("id")
+    }
 
     statuses = [
-        {"id": s.get("id"), "name": s.get("name")}
-        for s in (wf.get("statuses") or [])
+        {
+            "id": ref,
+            "name": (status_catalog.get(ref) or {}).get("name"),
+            "status_category": (status_catalog.get(ref) or {}).get("statusCategory"),
+        }
+        for ref in (
+            s.get("statusReference") for s in (wf.get("statuses") or [])
+        )
+        if ref
     ]
 
-    def _from_names(raw_from: Any) -> List[str]:
-        """Normalize a transition's 'from' field to a list of status names."""
-        items = raw_from if isinstance(raw_from, list) else [raw_from]
-        return [f.get("name") if isinstance(f, dict) else f for f in items if f]
+    def _from_names(transition_type: Optional[str], links: Any) -> List[str]:
+        """Resolve a DIRECTED transition's link sources to status names.
 
-    def _to_name(raw_to: Any) -> Optional[str]:
-        """Normalize a transition's 'to' field to a status name."""
-        if isinstance(raw_to, dict):
-            return raw_to.get("name")
-        return raw_to
+        GLOBAL and INITIAL transitions carry no explicit source status in
+        this schema (GLOBAL means "from any status"; INITIAL means "from
+        none, this creates the issue") -- both are reported as an empty
+        list, matching how the singular endpoint represented them.
+        """
+        if transition_type != "DIRECTED":
+            return []
+        names = []
+        for link in (links or []):
+            ref = link.get("fromStatusReference") if isinstance(link, dict) else None
+            entry = status_catalog.get(ref) if ref else None
+            if entry and entry.get("name"):
+                names.append(entry["name"])
+        return names
+
+    def _status_name(ref: Optional[str]) -> Optional[str]:
+        """Resolve a statusReference to its status name via the catalog."""
+        entry = status_catalog.get(ref) if ref else None
+        return entry.get("name") if entry else None
 
     transitions = [
         {
             "id": t.get("id"),
             "name": t.get("name"),
-            "from": _from_names(t.get("from")),
-            "to": _to_name(t.get("to")),
+            "from": _from_names(t.get("type"), t.get("links")),
+            "to": _status_name(t.get("toStatusReference")),
             "type": t.get("type"),
         }
         for t in (wf.get("transitions") or [])
@@ -4849,6 +4924,7 @@ def _fetch_workflow_detail(cfg: Dict[str, str], workflow_name: str) -> Dict[str,
         "name": workflow_name,
         "entity_id": wf.get("id"),
         "version": wf.get("version"),
+        "is_editable": wf.get("isEditable"),
         "statuses": statuses,
         "transitions": transitions,
     }
@@ -4880,47 +4956,39 @@ def _resolve_status_id(cfg: Dict[str, str], status_name: str) -> Optional[str]:
 
 
 def _extract_workflow_validation_errors(validation: Any) -> List[str]:
-    """Pull human-readable error strings out of a Bulk Workflows API response.
+    """Pull human-readable ERROR-level messages out of a validation response.
 
-    The validation and update endpoints return errors embedded in a 200
-    response body rather than always via HTTP status (consistent with other
-    Jira Cloud bulk-operation APIs), and the exact shape of that body is one
-    of the unconfirmed details noted in this module's header comment. This
-    function is deliberately defensive: it tries several known-plausible
-    shapes (a top-level errorMessages/errors dict, a flat list of error
-    objects, per-workflow nested errors) and returns whatever it can find
-    rather than raising on an unexpected shape, so an unfamiliar response
-    still surfaces as much detail as possible instead of a bare KeyError.
+    Confirmed 2026-09-08 (GitHub #10) by downloading and parsing the full
+    swagger-v3.v3.json spec locally: ``POST /rest/api/3/workflows/update/
+    validation`` returns a ``WorkflowValidationErrorList``, always shaped
+    ``{"errors": [{"message": ..., "level": "WARNING"|"ERROR", ...}, ...]}``
+    -- a single flat list, never per-workflow-nested, and never using an
+    ``errorMessages`` key. Those alternate shapes this function used to guess
+    at were never observed in the real schema and have been dropped; a
+    ``WARNING``-level entry is informational (Jira still allows the update)
+    and is deliberately excluded from the returned list so a clean payload
+    is not blocked by a non-blocking warning -- only ``ERROR``-level entries,
+    and any entry that omits ``level`` entirely, are treated as blocking.
 
     Args:
         validation: Parsed JSON response from the validate or update endpoint.
 
     Returns:
-        List of error message strings. Empty when no errors were found in
-        any of the recognized shapes.
+        List of ERROR-level message strings. Empty when validation passed
+        (Jira returns ``{"errors": []}`` on success, not an absent key).
     """
-    if not validation:
+    if not validation or not isinstance(validation, dict):
         return []
 
     errors: List[str] = []
-
-    if isinstance(validation, list):
-        for item in validation:
-            if isinstance(item, dict):
-                errors.append(item.get("message") or item.get("errorMessage") or str(item))
-            elif item:
-                errors.append(str(item))
-        return errors
-
-    if isinstance(validation, dict):
-        errors.extend(validation.get("errorMessages") or [])
-        for e in (validation.get("errors") or []):
-            errors.append(e.get("message") if isinstance(e, dict) else str(e))
-        for wf in (validation.get("workflows") or []):
-            if not isinstance(wf, dict):
-                continue
-            for e in (wf.get("errors") or []):
-                errors.append(e.get("message") if isinstance(e, dict) else str(e))
+    for e in (validation.get("errors") or []):
+        if not isinstance(e, dict):
+            if e:
+                errors.append(str(e))
+            continue
+        if e.get("level") == "WARNING":
+            continue
+        errors.append(e.get("message") or e.get("code") or str(e))
 
     return errors
 
@@ -5208,11 +5276,19 @@ def jira_add_workflow_status(
         if not workflow_entity_id or not workflow_version:
             raise RuntimeError(
                 "Workflow '" + target_workflow_name + "' did not return an "
-                "entityId/version from GET /workflow/search -- the Bulk "
+                "entityId/version from GET /workflows/search -- the Bulk "
                 "Update Workflows API requires both to identify and "
                 "optimistic-lock the workflow being mutated, and this tool "
                 "will not guess at either. Got entity_id="
                 + repr(workflow_entity_id) + ", version=" + repr(workflow_version)
+            )
+        if detail.get("is_editable") is False:
+            raise RuntimeError(
+                "Workflow '" + target_workflow_name + "' reports isEditable="
+                "False -- Jira will not accept a mutation against it, so this "
+                "tool refuses to submit one. (isEditable=True was confirmed "
+                "live for ALGO's own workflow; this only fires for a "
+                "genuinely locked workflow.)"
             )
         existing_by_lower = {
             s["name"].lower(): s for s in detail["statuses"] if s.get("name")
@@ -5236,8 +5312,17 @@ def jira_add_workflow_status(
                     + ", ".join(s["name"] for s in detail["statuses"])
                 )
 
-        def _status_ref_entry(status_value: str, ref: str) -> Dict[str, str]:
+        def _status_ref_entry(status_value: str, ref: str) -> Dict[str, Any]:
             """Build one existing-status entry for the bulk-update payload.
+
+            Per the ``WorkflowStatusUpdate`` schema (confirmed 2026-09-08 by
+            downloading and parsing the full swagger-v3.v3.json spec locally,
+            rather than the earlier attempt's cross-referenced-but-unconfirmed
+            guess), ``name`` and ``statusCategory`` are required on every
+            entry in the payload's top-level ``statuses[]`` array -- even one
+            that reuses an existing status by ``id``. Omitting them was a
+            second latent defect that would have surfaced as a fresh 400 once
+            the entityId/version bug (GitHub #10) was fixed.
 
             Args:
                 status_value: Existing status name (already validated present).
@@ -5248,7 +5333,7 @@ def jira_add_workflow_status(
                     looked up, but a non-UUID string is rejected outright.
 
             Returns:
-                Dict with id and statusReference.
+                Dict with id, name, statusCategory, and statusReference.
 
             Raises:
                 RuntimeError: If the status has no id from the workflow detail
@@ -5261,9 +5346,23 @@ def jira_add_workflow_status(
                 raise RuntimeError(
                     "Could not resolve a Jira status id for '" + status_value + "'."
                 )
-            return {"id": status_id, "statusReference": ref}
+            existing_category = existing.get("status_category")
+            if not existing_category:
+                raise RuntimeError(
+                    "Could not resolve a statusCategory for existing status '"
+                    + status_value + "' from workflow '" + target_workflow_name
+                    + "' -- required by the Bulk Update Workflows API even "
+                    "when reusing an existing status, and this tool will not "
+                    "guess at one."
+                )
+            return {
+                "id": status_id,
+                "name": existing["name"],
+                "statusCategory": existing_category,
+                "statusReference": ref,
+            }
 
-        statuses_payload: List[Dict[str, str]] = []
+        statuses_payload: List[Dict[str, Any]] = []
         transitions_payload: List[Dict[str, Any]] = []
         transitions_added: List[str] = []
         new_ref = str(uuid.uuid4())
@@ -5273,9 +5372,11 @@ def jira_add_workflow_status(
             statuses_payload.append(_status_ref_entry(insert_after_status, after_ref))
             in_name = transition_name_in or status_name
             transitions_payload.append({
+                "id": str(uuid.uuid4()),
                 "name": in_name,
                 "type": "DIRECTED",
-                "links": [{"fromStatusReference": after_ref, "toStatusReference": new_ref}],
+                "toStatusReference": new_ref,
+                "links": [{"fromStatusReference": after_ref}],
             })
             transitions_added.append(in_name)
 
@@ -5284,9 +5385,11 @@ def jira_add_workflow_status(
             statuses_payload.append(_status_ref_entry(insert_before_status, before_ref))
             out_name = transition_name_out or insert_before_status
             transitions_payload.append({
+                "id": str(uuid.uuid4()),
                 "name": out_name,
                 "type": "DIRECTED",
-                "links": [{"fromStatusReference": new_ref, "toStatusReference": before_ref}],
+                "toStatusReference": before_ref,
+                "links": [{"fromStatusReference": new_ref}],
             })
             transitions_added.append(out_name)
 
@@ -5311,7 +5414,15 @@ def jira_add_workflow_status(
             ],
         }
 
-        validation = _request(cfg, "POST", _WORKFLOWS_VALIDATE_PATH, payload)
+        # WorkflowUpdateValidateRequestBean wraps the request in a "payload"
+        # key; POST /workflows/update (the mutation call further below) does
+        # not -- it takes the WorkflowUpdateRequest body directly. Confirmed
+        # 2026-09-08 (GitHub #10) from the swagger-v3.v3.json spec; sending
+        # the unwrapped body to /validation (as an earlier attempt did) gets
+        # a generic "Invalid request payload" 400 with no further detail.
+        validation = _request(
+            cfg, "POST", _WORKFLOWS_VALIDATE_PATH, {"payload": payload}
+        )
         val_errors = _extract_workflow_validation_errors(validation)
         if val_errors:
             raise RuntimeError(

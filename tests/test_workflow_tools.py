@@ -142,6 +142,10 @@ WORKFLOW_ENTITY_ID = "c5ef565c-1b1e-427e-bc3b-e677b0dc027c"
 WORKFLOW_VERSION_ID = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
 WORKFLOW_VERSION_NUMBER = 1
 
+_STATUS_REF_TODO = "10001"
+_STATUS_REF_IN_PROGRESS = "10002"
+_STATUS_REF_DONE = "10003"
+
 
 def _workflow_detail(
     workflow_name="ALGO Workflow",
@@ -149,49 +153,91 @@ def _workflow_detail(
     version_id=WORKFLOW_VERSION_ID,
     version_number=WORKFLOW_VERSION_NUMBER,
 ):
-    """Build a GET /workflow/search response entry.
+    """Build a GET /workflows/search (plural) response.
 
-    Real Jira Cloud responses for this endpoint carry a top-level "id"
-    (the workflow's entityId, a UUID string -- not its display name) and
-    a "version" object used for optimistic locking, both distinct from
-    "name". jira_add_workflow_status echoes these back unchanged in its
-    mutation payload's workflows[] entry (GitHub issue #10) -- omitting
-    either from this fixture reproduces the exact defect that fix
-    addresses, so both are present by default here.
+    Matches the real ``WorkflowSearchResponse`` / ``JiraWorkflow`` schemas
+    (confirmed 2026-09-08, GitHub issue #10, by downloading and parsing the
+    full swagger-v3.v3.json spec locally, cross-checked against the actual
+    example response body in that spec for this endpoint): a top-level
+    "statuses" catalog whose entries carry both "id" (the real Jira status
+    id) and "statusReference" -- and the spec's own example response shows
+    these two fields holding the *same* value for every status ("id":
+    "10003", "statusReference": "10003", etc), which is what
+    _fetch_workflow_detail's status_catalog lookup (keyed by "id", queried
+    by the workflow-level "statusReference") depends on to resolve a
+    status's name/category at all. Using two different-looking values here
+    (an earlier version of this fixture used "1"/"2"/"3" ids alongside
+    unrelated UUID statusReferences) silently produces a status_catalog
+    that never matches, leaving every status name None and
+    existing_by_lower empty -- the actual production lookup logic was
+    correct; only this fixture's data was unrealistic. "values" holds one
+    JiraWorkflow per match, whose own "id" is the workflow's entityId (a
+    UUID string, not its display name), "version" is the real {"id",
+    "versionNumber"} object used for optimistic locking, "statuses" is a
+    list of {"statusReference"} entries pointing into the top-level
+    catalog, and "transitions" carries "toStatusReference" plus "links":
+    [{"fromStatusReference"}] rather than the older singular endpoint's
+    name-based "from"/"to" shape. _fetch_workflow_detail also filters
+    "values" by matching "name" against the requested workflow_name --
+    omitting "name" here makes every match fail and _fetch_workflow_detail
+    raise "Workflow not found", which jira_get_workflow_info silently
+    swallows into workflow_detail_errors, so "name" is required here too.
     """
     return {
+        "statuses": [
+            {
+                "id": _STATUS_REF_TODO,
+                "statusReference": _STATUS_REF_TODO,
+                "name": "To Do",
+                "statusCategory": "TODO",
+            },
+            {
+                "id": _STATUS_REF_IN_PROGRESS,
+                "statusReference": _STATUS_REF_IN_PROGRESS,
+                "name": "In Progress",
+                "statusCategory": "IN_PROGRESS",
+            },
+            {
+                "id": _STATUS_REF_DONE,
+                "statusReference": _STATUS_REF_DONE,
+                "name": "Done",
+                "statusCategory": "DONE",
+            },
+        ],
         "values": [
             {
                 "id": entity_id,
+                "name": workflow_name,
                 "version": {"id": version_id, "versionNumber": version_number},
+                "isEditable": True,
                 "statuses": [
-                    {"id": "1", "name": "To Do"},
-                    {"id": "2", "name": "In Progress"},
-                    {"id": "3", "name": "Done"},
+                    {"statusReference": _STATUS_REF_TODO},
+                    {"statusReference": _STATUS_REF_IN_PROGRESS},
+                    {"statusReference": _STATUS_REF_DONE},
                 ],
                 "transitions": [
                     {
                         "id": "11",
                         "name": "Start Progress",
-                        "from": [{"name": "To Do"}],
-                        "to": {"name": "In Progress"},
-                        "type": "directed",
+                        "type": "DIRECTED",
+                        "toStatusReference": _STATUS_REF_IN_PROGRESS,
+                        "links": [{"fromStatusReference": _STATUS_REF_TODO}],
                     },
                     {
                         "id": "12",
                         "name": "Done",
-                        "from": [{"name": "In Progress"}],
-                        "to": {"name": "Done"},
-                        "type": "directed",
+                        "type": "DIRECTED",
+                        "toStatusReference": _STATUS_REF_DONE,
+                        "links": [{"fromStatusReference": _STATUS_REF_IN_PROGRESS}],
                     },
                 ],
             }
-        ]
+        ],
     }
 
 
 def _workflow_detail_missing_identity(workflow_name="ALGO Workflow"):
-    """A GET /workflow/search response entry missing "id" and "version".
+    """A GET /workflows/search response entry missing "id" and "version".
 
     Regression fixture for GitHub issue #10: the pre-fix code did not
     require either field, so a Jira response shaped like this (or a stub
@@ -202,7 +248,7 @@ def _workflow_detail_missing_identity(workflow_name="ALGO Workflow"):
     entry = dict(detail["values"][0])
     entry.pop("id", None)
     entry.pop("version", None)
-    return {"values": [entry]}
+    return {"statuses": detail["statuses"], "values": [entry]}
 
 
 def _decode_request_body(call):
@@ -212,11 +258,30 @@ def _decode_request_body(call):
 
 
 def _validation_ok():
-    return {"errorMessages": [], "errors": []}
+    """A clean POST /workflows/update/validation response (no errors)."""
+    return {"errors": []}
 
 
 def _validation_rejected():
-    return {"errorMessages": ["Transition must specify a links field."]}
+    """A POST /workflows/update/validation response with one ERROR-level entry.
+
+    Matches the real ``WorkflowValidationErrorList`` schema (confirmed
+    2026-09-08, GitHub issue #10, from swagger-v3.v3.json): always
+    ``{"errors": [{"message": ..., "level": "WARNING"|"ERROR"}]}``, never
+    the ``errorMessages`` key an earlier version of this fixture used --
+    that shape is silently ignored by _extract_workflow_validation_errors
+    (validation.get("errors") returns None -> treated as no errors at
+    all), so a fixture built that way cannot actually exercise the
+    validation-rejection code path it is meant to test.
+    """
+    return {
+        "errors": [
+            {
+                "message": "Transition must specify a links field.",
+                "level": "ERROR",
+            }
+        ]
+    }
 
 
 def _update_ok():
@@ -577,7 +642,13 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
         self.assertTrue(result["success"])
 
         validate_call = mock_urlopen.call_args_list[3]
-        payload = _decode_request_body(validate_call)
+        # POST /workflows/update/validation's body is a
+        # WorkflowUpdateValidateRequestBean -- {"payload": <the actual
+        # WorkflowUpdateRequest>} -- not the WorkflowUpdateRequest directly
+        # (GitHub issue #10 round 3, fix #3). Only the mutation call
+        # (POST /workflows/update) takes the request body unwrapped.
+        envelope = _decode_request_body(validate_call)
+        payload = envelope["payload"]
 
         self.assertEqual(len(payload["workflows"]), 1)
         workflow_entry = payload["workflows"][0]
@@ -592,9 +663,53 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
         for status_entry in workflow_entry["statuses"]:
             uuid.UUID(status_entry["statusReference"])
         for transition in workflow_entry["transitions"]:
+            # toStatusReference lives on the transition itself, not inside
+            # links[] (GitHub issue #10 round 3, fix #2) -- links[] only
+            # carries fromStatusReference/fromPort/toPort.
+            uuid.UUID(transition["toStatusReference"])
             for link in transition["links"]:
                 uuid.UUID(link["fromStatusReference"])
-                uuid.UUID(link["toStatusReference"])
+
+    @patch("urllib.request.urlopen")
+    def test_transitions_carry_uuid_id_field(self, mock_urlopen):
+        """GitHub issue #10 round 4 regression: TransitionUpdateDTO's "id" is
+        a caller-supplied local reference for a transition, the same role
+        statusReference plays for statuses -- confirmed by both the
+        workflows/update and workflows/create examples in swagger-v3.v3.json
+        carrying one on every transition entry, including ones inside a
+        brand-new workflow that has no pre-existing Jira transition id.
+        Omitting it (the pre-fix payload) is rejected by live Jira validation
+        with "Missing required field ...transitions.[0].id".
+        """
+        mock_urlopen.side_effect = [
+            _make_resp(_project_algo()),
+            _make_resp(_scheme_not_shared()),
+            _make_resp(_workflow_detail()),
+            _make_resp(_validation_ok()),
+            _make_resp(_update_ok()),
+        ]
+        result = _parse(server.jira_add_workflow_status(
+            project_key="ALGO",
+            status_name="In Review",
+            insert_after_status="In Progress",
+            insert_before_status="Done",
+        ))
+        self.assertTrue(result["success"])
+
+        validate_call = mock_urlopen.call_args_list[3]
+        # See test_validation_payload_carries_entity_id_version_and_uuid_refs
+        # for why the validation call's body must be unwrapped via "payload".
+        envelope = _decode_request_body(validate_call)
+        transitions = envelope["payload"]["workflows"][0]["transitions"]
+
+        self.assertEqual(len(transitions), 2)
+        ids = set()
+        for transition in transitions:
+            self.assertIn("id", transition)
+            uuid.UUID(transition["id"])  # raises ValueError if not a UUID
+            ids.add(transition["id"])
+        # Each transition gets its own distinct local reference id.
+        self.assertEqual(len(ids), 2)
 
     @patch("urllib.request.urlopen")
     def test_missing_entity_id_or_version_raises_instead_of_guessing(
