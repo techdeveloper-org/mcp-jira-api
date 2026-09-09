@@ -671,24 +671,27 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
                 uuid.UUID(link["fromStatusReference"])
 
     @patch("urllib.request.urlopen")
-    def test_new_transitions_omit_id_field(self, mock_urlopen):
-        """GitHub issue #10 round 5 regression: round 4's premise -- that
-        TransitionUpdateDTO's "id" plays the same caller-supplied local
-        reference role that WorkflowStatusUpdate's "statusReference" plays
-        for statuses -- was wrong. TransitionUpdateDTO has no separate
-        reference field at all; "id" is its ONLY identifier, and
-        WorkflowStatusUpdate's own schema description for "id" confirms the
-        role such a field plays across this API: "the ID of the status. When
-        reusing an existing status, this field should be provided." A new
-        transition has no pre-existing Jira id to reuse, so "id" must be
-        omitted entirely -- a new transition is already fully identified by
-        its toStatusReference and links[].fromStatusReference, both of which
-        point at statusReference values. Sending a client-generated uuid4()
-        as "id" (round 4's fix) made live Jira validation try to resolve it
-        as a reference to an already-existing transition (whose real ids are
-        small integer strings, per this endpoint's own swagger example) and
-        reject it with "payload.workflows[0].transitions[0].id.value :
-        Invalid format".
+    def test_new_transitions_carry_a_hyphen_less_hex_id(self, mock_urlopen):
+        """GitHub issue #10, round 6 (rounds 4 and 5 were both wrong, live-
+        verified against the real ALGO project both times):
+
+        - Round 4 sent a hyphenated uuid4() string as "id" -> live Jira
+          rejected with "transitions[0].id.value: Invalid format".
+        - Round 5's fix, reasoning from WorkflowStatusUpdate's schema
+          description ("the ID of the status. When reusing an existing
+          status, this field should be provided.") by analogy, omitted "id"
+          entirely on the theory that TransitionUpdateDTO's only identifier
+          plays the same existing-entity-only role. That regressed live
+          validation back to round 3's original error: "Missing required
+          field 'payload.workflows.[0].transitions.[0].id'" -- "id" is
+          required after all, for both new and existing transitions.
+
+        Round 6: the format Jira rejected in round 4 was specifically the
+        hyphenated UUID string form, not a client-generated reference as a
+        concept -- switching to uuid4().hex (32 lowercase hex characters, no
+        hyphens) is accepted. Both failure modes were confirmed against the
+        live Jira API in the same session, not guessed from documentation
+        alone.
         """
         mock_urlopen.side_effect = [
             _make_resp(_project_algo()),
@@ -713,7 +716,11 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
 
         self.assertEqual(len(transitions), 2)
         for transition in transitions:
-            self.assertNotIn("id", transition)
+            self.assertIn("id", transition)
+            transition_id = transition["id"]
+            self.assertEqual(len(transition_id), 32, transition_id)
+            self.assertNotIn("-", transition_id)
+            int(transition_id, 16)  # raises ValueError if not valid hex
 
     @patch("urllib.request.urlopen")
     def test_missing_entity_id_or_version_raises_instead_of_guessing(

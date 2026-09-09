@@ -5392,6 +5392,7 @@ def jira_add_workflow_status(
             statuses_payload.append(_status_ref_entry(insert_after_status, after_ref))
             in_name = transition_name_in or status_name
             transitions_payload.append({
+                "id": uuid.uuid4().hex,
                 "name": in_name,
                 "type": "DIRECTED",
                 "toStatusReference": new_ref,
@@ -5404,6 +5405,7 @@ def jira_add_workflow_status(
             statuses_payload.append(_status_ref_entry(insert_before_status, before_ref))
             out_name = transition_name_out or insert_before_status
             transitions_payload.append({
+                "id": uuid.uuid4().hex,
                 "name": out_name,
                 "type": "DIRECTED",
                 "toStatusReference": before_ref,
