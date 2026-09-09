@@ -4650,28 +4650,56 @@ def jira_dependency_check(
 #
 # Round 5 (live-tested against real project ALGO once round 4's fix was
 # live; validate_only=True returned "payload.workflows[0].transitions[0].id
-# .value : Invalid format" for every transition): round 4's premise was
-# wrong. TransitionUpdateDTO has no separate reference field the way
-# WorkflowStatusUpdate has both "id" (existing) and "statusReference" (new
-# or existing, caller-chosen correlation value) -- for transitions, "id" is
-# the ONLY identifier field, and WorkflowStatusUpdate's own schema
-# description confirms the role such an "id" field plays across this API:
-# "the ID of the status. When reusing an existing status, this field should
-# be provided." There is no equivalent of statusReference for transitions
-# because none is needed -- a new transition is already fully identified by
-# its toStatusReference and links[].fromStatusReference, both of which point
-# at statusReference values. Sending a client-generated uuid4() as a
-# transition's "id" made Jira try to resolve it as a reference to an
-# already-existing transition (whose real ids are small integer strings --
-# see the "1"/"11"/"21"/"31" ids in this endpoint's own swagger example --
-# not UUIDs), which is what "Invalid format" meant. The fix omits "id"
-# entirely from new transition entries; Jira assigns the real id once the
-# transition is created.
+# .value : Invalid format" for every transition): theorized, by analogy with
+# WorkflowStatusUpdate's schema description ("the ID of the status. When
+# reusing an existing status, this field should be provided."), that "id" on
+# a NEW transition should be omitted entirely. This was WRONG -- disproven
+# by round 6's live test, below.
+#
+# Round 6 (live-tested once round 5's fix was live): omitting "id" entirely
+# regressed straight back to round 3's original error, "Missing required
+# field 'payload.workflows.[0].transitions.[0].id'" -- so "id" is required
+# unconditionally, for both new and existing transitions. Re-tried a
+# hyphen-less uuid4().hex on the theory that round 4's hyphens specifically
+# were the "Invalid format" trigger; also live-rejected with the exact same
+# error as round 4's hyphenated uuid4().
+#
+# Round 7 (live-tested once round 6's fix was live): with both UUID shapes
+# rejected identically, tried sequential negative integers ("-1", "-2", ...)
+# as a caller-supplied local id, following Atlassian's placeholder-id
+# convention used elsewhere in its bulk-write APIs. Also live-rejected with
+# "Invalid format" -- negative sign included.
+#
+# Round 8 (diagnosed with a standalone script calling
+# POST /workflows/update/validation directly, bypassing the MCP server
+# process entirely -- each prior round needed a full /mcp reconnect per
+# attempt to pick up a code change, which is why rounds 4-7 each needed a
+# separate live-test round-trip): jira_get_workflow_info's own read of this
+# workflow shows its real transition ids are plain positive decimal
+# integers ("1", "11", "21", "31") -- never UUID-shaped, and never negative.
+# Switching to sequential positive integers, comfortably above any existing
+# id, made the "Invalid format" 400 disappear for good.
+#
+# That same probe script then surfaced the actual reason every prior round
+# never got further: with the id-format issue out of the way, Jira responded
+# with real structural errors -- "Workflow must have exactly one initial
+# transition" and "This status cannot be reached from the start of the
+# workflow" for every status this tool was not touching. Sending only the
+# newly-added transitions (rounds 3-7's design, matching a PATCH-style delta
+# assumption) makes Jira replace the workflow's ENTIRE transition graph with
+# just those few -- POST /workflows/update is a full redefinition of the
+# workflow, not a delta. The actual fix rebuilds the complete graph on every
+# call: every existing status and transition, unchanged, plus the two new
+# ones -- confirmed live against ALGO with HTTP 200 and zero ERROR-level
+# validation entries (one non-blocking WARNING about a duplicate outbound
+# transition name, which this workflow's own existing GLOBAL transitions
+# already exhibit by convention -- naming a transition after its destination
+# status is normal here, not a defect).
 #
 # This is why the tool always validates before applying: a remaining schema
 # mismatch surfaces as Jira's own validation error text (see
-# _extract_workflow_validation_errors, which now also filters WARNING-level
-# entries -- confirmed non-blocking per the same schema -- so a clean
+# _extract_workflow_validation_errors, which filters WARNING-level entries --
+# confirmed non-blocking per the real live response above -- so a clean
 # payload cannot be rejected for a warning) rather than as a silent partial
 # mutation of a live workflow.
 
@@ -5383,52 +5411,111 @@ def jira_add_workflow_status(
                 "statusReference": ref,
             }
 
-        statuses_payload: List[Dict[str, Any]] = []
-        transitions_payload: List[Dict[str, Any]] = []
-        transitions_added: List[str] = []
+        # Round 8 (GH-10), live-tested against real project ALGO with a
+        # standalone probe script hitting /workflows/update/validation
+        # directly (bypassing the MCP server process, which needs a full
+        # reconnect to pick up each code change): rounds 4-7 all iterated on
+        # the *format* of a new transition's "id" and never got past a 400
+        # from that field alone. Once "id" was tried as a plain positive
+        # integer (round 8's fix, below) the 400 disappeared -- but the
+        # request then surfaced real structural errors that had been hidden
+        # behind it the whole time: "Workflow must have exactly one initial
+        # transition" and "This status cannot be reached from the start of
+        # the workflow" for every status this tool was NOT touching. Sending
+        # only the two new transitions (rounds 3-7's design) makes Jira
+        # replace the workflow's ENTIRE transition graph with just those two
+        # -- this API is not a delta/patch, it is a full redefinition. The
+        # fix rebuilds the complete graph every call: every existing status
+        # and transition, unchanged, plus the two new ones. Confirmed live:
+        # HTTP 200 with only a non-blocking WARNING (duplicate outbound
+        # transition name from the new status to "Done", because this
+        # workflow already names every transition after its destination
+        # status by convention -- the same convention this tool's own
+        # transition_name_out default follows).
+        #
+        # "id" format: jira_get_workflow_info shows this workflow's real
+        # transition ids are plain positive decimal integers ("1", "11",
+        # "21", "31"), never UUIDs. A hyphenated uuid4() (round 4), a
+        # hyphen-less uuid4().hex (round 6), and negative integers (round 7)
+        # were all live-rejected with "transitions[N].id.value: Invalid
+        # format"; plain positive integers (string or JSON number, both
+        # tested) validated cleanly. New transitions get sequential integers
+        # starting comfortably above the highest existing numeric id, so
+        # there is no risk of colliding with one.
+        status_refs: Dict[str, str] = {
+            s["name"]: str(uuid.uuid4()) for s in detail["statuses"] if s.get("name")
+        }
         new_ref = str(uuid.uuid4())
-        # Round 7 (GH-10): jira_get_workflow_info confirms this workflow's
-        # real transition ids are plain positive decimal integer strings
-        # ("1", "11", "21", "31") -- both a hyphenated uuid4() (round 4) and
-        # a hyphen-less hex uuid4().hex (round 6) were live-rejected with
-        # "transitions[N].id.value: Invalid format", so the field is
-        # numeric-only, not UUID-shaped at all. Negative integers are
-        # Atlassian's common bulk-write placeholder-id convention for a
-        # not-yet-created entity (e.g. custom field context bulk APIs), so
-        # new transitions get sequential negative local ids here.
-        next_new_transition_id = itertools.count(-1, -1)
+        status_refs[status_name] = new_ref
+
+        statuses_payload: List[Dict[str, Any]] = [
+            _status_ref_entry(s["name"], status_refs[s["name"]])
+            for s in detail["statuses"] if s.get("name")
+        ]
+        statuses_payload.append({
+            "name": status_name,
+            "statusCategory": status_category,
+            "statusReference": new_ref,
+        })
+
+        def _next_transition_id_start(transitions: List[Dict[str, Any]]) -> int:
+            """Pick a safe starting point for new sequential integer ids.
+
+            Takes the highest existing numeric transition id (0 if none
+            parse as integers) and a floor of 100000, so a freshly generated
+            id can never collide with one of this workflow's real,
+            Jira-assigned ids.
+            """
+            ceiling = 100000
+            for t in transitions:
+                try:
+                    ceiling = max(ceiling, int(t.get("id")))
+                except (TypeError, ValueError):
+                    continue
+            return ceiling + 1
+
+        next_new_transition_id = itertools.count(
+            _next_transition_id_start(detail["transitions"])
+        )
+
+        transitions_payload: List[Dict[str, Any]] = [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "type": t["type"],
+                "toStatusReference": status_refs.get(t["to"]),
+                "links": [
+                    {"fromStatusReference": status_refs[n]}
+                    for n in t["from"] if n in status_refs
+                ],
+            }
+            for t in detail["transitions"]
+        ]
+        transitions_added: List[str] = []
 
         if insert_after_status:
-            after_ref = str(uuid.uuid4())
-            statuses_payload.append(_status_ref_entry(insert_after_status, after_ref))
+            after_name = existing_by_lower[insert_after_status.lower()]["name"]
             in_name = transition_name_in or status_name
             transitions_payload.append({
                 "id": str(next(next_new_transition_id)),
                 "name": in_name,
                 "type": "DIRECTED",
                 "toStatusReference": new_ref,
-                "links": [{"fromStatusReference": after_ref}],
+                "links": [{"fromStatusReference": status_refs[after_name]}],
             })
             transitions_added.append(in_name)
 
         if insert_before_status:
-            before_ref = str(uuid.uuid4())
-            statuses_payload.append(_status_ref_entry(insert_before_status, before_ref))
+            before_name = existing_by_lower[insert_before_status.lower()]["name"]
             out_name = transition_name_out or insert_before_status
             transitions_payload.append({
                 "id": str(next(next_new_transition_id)),
                 "name": out_name,
                 "type": "DIRECTED",
-                "toStatusReference": before_ref,
+                "toStatusReference": status_refs[before_name],
                 "links": [{"fromStatusReference": new_ref}],
             })
             transitions_added.append(out_name)
-
-        statuses_payload.append({
-            "name": status_name,
-            "statusCategory": status_category,
-            "statusReference": new_ref,
-        })
 
         payload = {
             "statuses": statuses_payload,

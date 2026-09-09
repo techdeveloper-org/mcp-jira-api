@@ -671,32 +671,25 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
                 uuid.UUID(link["fromStatusReference"])
 
     @patch("urllib.request.urlopen")
-    def test_new_transitions_carry_sequential_negative_integer_ids(self, mock_urlopen):
-        """GitHub issue #10, round 7 (rounds 4, 5 and 6 were all wrong, each
-        live-verified against the real ALGO project):
+    def test_new_transitions_carry_sequential_positive_integer_ids_above_existing(
+        self, mock_urlopen
+    ):
+        """GitHub issue #10, round 8 (rounds 4-7 were all wrong on the "id"
+        field's format, each live-verified against the real ALGO project):
 
-        - Round 4 sent a hyphenated uuid4() string as "id" -> live Jira
-          rejected with "transitions[0].id.value: Invalid format".
-        - Round 5 reasoned from WorkflowStatusUpdate's schema description
-          ("the ID of the status. When reusing an existing status, this
-          field should be provided.") by analogy and omitted "id" entirely.
-          That regressed live validation back to round 3's original error:
-          "Missing required field 'payload.workflows.[0].transitions.[0].id'"
-          -- "id" is required after all, for both new and existing
-          transitions.
-        - Round 6 switched to uuid4().hex (32 lowercase hex characters, no
-          hyphens), hypothesizing the hyphens were what round 4 rejected.
-          Live-tested and it failed with the exact same "Invalid format"
-          error as round 4 -- proving the field rejects UUID-shaped values
-          in general, not just the hyphenated form.
+        - Round 4: hyphenated uuid4() -> "Invalid format".
+        - Round 5: omitted "id" entirely -> regressed to round 3's "Missing
+          required field" error -- "id" is required after all.
+        - Round 6: uuid4().hex (no hyphens) -> same "Invalid format" as
+          round 4 -- the field rejects UUID-shaped values generally.
+        - Round 7: sequential negative integers -> same "Invalid format" --
+          the negative sign was rejected too.
 
-        Round 7: jira_get_workflow_info against the real ALGO project shows
+        Round 8: jira_get_workflow_info against the real ALGO project shows
         this workflow's actual transition ids are plain positive decimal
-        integer strings ("1", "11", "21", "31") -- not UUIDs at all, so the
-        field is validated as numeric. Sequential negative integers are
-        Atlassian's common bulk-write placeholder-id convention for a
-        not-yet-created entity (used elsewhere, e.g. custom field context
-        bulk APIs), so new transitions now get "-1", "-2", etc.
+        integers ("1", "11", "21", "31"). Sequential positive integers,
+        starting comfortably above any id already present (this fixture's
+        existing transitions use "11" and "12"), validated cleanly live.
         """
         mock_urlopen.side_effect = [
             _make_resp(_project_algo()),
@@ -719,12 +712,20 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
         envelope = _decode_request_body(validate_call)
         transitions = envelope["payload"]["workflows"][0]["transitions"]
 
-        self.assertEqual(len(transitions), 2)
+        # The payload now carries the FULL transition graph (existing +
+        # new), not just a delta -- see this module's Round 8 header comment
+        # in server.py for why a delta-only payload is silently treated as
+        # the entire workflow definition by Jira. This fixture's existing
+        # workflow has 2 transitions ("11" Start Progress, "12" Done); this
+        # call adds 2 more.
+        self.assertEqual(len(transitions), 4)
+        existing_ids = {"11", "12"}
+        new_ids = [t["id"] for t in transitions if t["id"] not in existing_ids]
+        self.assertEqual(len(new_ids), 2)
         seen_ids = set()
-        for transition in transitions:
-            self.assertIn("id", transition)
-            transition_id = transition["id"]
-            self.assertRegex(transition_id, r"^-[0-9]+$")
+        for transition_id in new_ids:
+            self.assertRegex(transition_id, r"^[0-9]+$")
+            self.assertGreater(int(transition_id), 12, "must not collide with an existing id")
             seen_ids.add(transition_id)
         self.assertEqual(len(seen_ids), 2, "each new transition must get a distinct local id")
 
