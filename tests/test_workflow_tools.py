@@ -671,27 +671,32 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
                 uuid.UUID(link["fromStatusReference"])
 
     @patch("urllib.request.urlopen")
-    def test_new_transitions_carry_a_hyphen_less_hex_id(self, mock_urlopen):
-        """GitHub issue #10, round 6 (rounds 4 and 5 were both wrong, live-
-        verified against the real ALGO project both times):
+    def test_new_transitions_carry_sequential_negative_integer_ids(self, mock_urlopen):
+        """GitHub issue #10, round 7 (rounds 4, 5 and 6 were all wrong, each
+        live-verified against the real ALGO project):
 
         - Round 4 sent a hyphenated uuid4() string as "id" -> live Jira
           rejected with "transitions[0].id.value: Invalid format".
-        - Round 5's fix, reasoning from WorkflowStatusUpdate's schema
-          description ("the ID of the status. When reusing an existing
-          status, this field should be provided.") by analogy, omitted "id"
-          entirely on the theory that TransitionUpdateDTO's only identifier
-          plays the same existing-entity-only role. That regressed live
-          validation back to round 3's original error: "Missing required
-          field 'payload.workflows.[0].transitions.[0].id'" -- "id" is
-          required after all, for both new and existing transitions.
+        - Round 5 reasoned from WorkflowStatusUpdate's schema description
+          ("the ID of the status. When reusing an existing status, this
+          field should be provided.") by analogy and omitted "id" entirely.
+          That regressed live validation back to round 3's original error:
+          "Missing required field 'payload.workflows.[0].transitions.[0].id'"
+          -- "id" is required after all, for both new and existing
+          transitions.
+        - Round 6 switched to uuid4().hex (32 lowercase hex characters, no
+          hyphens), hypothesizing the hyphens were what round 4 rejected.
+          Live-tested and it failed with the exact same "Invalid format"
+          error as round 4 -- proving the field rejects UUID-shaped values
+          in general, not just the hyphenated form.
 
-        Round 6: the format Jira rejected in round 4 was specifically the
-        hyphenated UUID string form, not a client-generated reference as a
-        concept -- switching to uuid4().hex (32 lowercase hex characters, no
-        hyphens) is accepted. Both failure modes were confirmed against the
-        live Jira API in the same session, not guessed from documentation
-        alone.
+        Round 7: jira_get_workflow_info against the real ALGO project shows
+        this workflow's actual transition ids are plain positive decimal
+        integer strings ("1", "11", "21", "31") -- not UUIDs at all, so the
+        field is validated as numeric. Sequential negative integers are
+        Atlassian's common bulk-write placeholder-id convention for a
+        not-yet-created entity (used elsewhere, e.g. custom field context
+        bulk APIs), so new transitions now get "-1", "-2", etc.
         """
         mock_urlopen.side_effect = [
             _make_resp(_project_algo()),
@@ -715,12 +720,13 @@ class TestJiraAddWorkflowStatusHappyPath(unittest.TestCase):
         transitions = envelope["payload"]["workflows"][0]["transitions"]
 
         self.assertEqual(len(transitions), 2)
+        seen_ids = set()
         for transition in transitions:
             self.assertIn("id", transition)
             transition_id = transition["id"]
-            self.assertEqual(len(transition_id), 32, transition_id)
-            self.assertNotIn("-", transition_id)
-            int(transition_id, 16)  # raises ValueError if not valid hex
+            self.assertRegex(transition_id, r"^-[0-9]+$")
+            seen_ids.add(transition_id)
+        self.assertEqual(len(seen_ids), 2, "each new transition must get a distinct local id")
 
     @patch("urllib.request.urlopen")
     def test_missing_entity_id_or_version_raises_instead_of_guessing(

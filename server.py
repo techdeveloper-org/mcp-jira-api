@@ -42,6 +42,7 @@ Windows-Safe: ASCII only (cp1252 compatible)
 
 import base64
 import json
+import itertools
 import os
 import re
 import sys
@@ -5386,13 +5387,23 @@ def jira_add_workflow_status(
         transitions_payload: List[Dict[str, Any]] = []
         transitions_added: List[str] = []
         new_ref = str(uuid.uuid4())
+        # Round 7 (GH-10): jira_get_workflow_info confirms this workflow's
+        # real transition ids are plain positive decimal integer strings
+        # ("1", "11", "21", "31") -- both a hyphenated uuid4() (round 4) and
+        # a hyphen-less hex uuid4().hex (round 6) were live-rejected with
+        # "transitions[N].id.value: Invalid format", so the field is
+        # numeric-only, not UUID-shaped at all. Negative integers are
+        # Atlassian's common bulk-write placeholder-id convention for a
+        # not-yet-created entity (e.g. custom field context bulk APIs), so
+        # new transitions get sequential negative local ids here.
+        next_new_transition_id = itertools.count(-1, -1)
 
         if insert_after_status:
             after_ref = str(uuid.uuid4())
             statuses_payload.append(_status_ref_entry(insert_after_status, after_ref))
             in_name = transition_name_in or status_name
             transitions_payload.append({
-                "id": uuid.uuid4().hex,
+                "id": str(next(next_new_transition_id)),
                 "name": in_name,
                 "type": "DIRECTED",
                 "toStatusReference": new_ref,
@@ -5405,7 +5416,7 @@ def jira_add_workflow_status(
             statuses_payload.append(_status_ref_entry(insert_before_status, before_ref))
             out_name = transition_name_out or insert_before_status
             transitions_payload.append({
-                "id": uuid.uuid4().hex,
+                "id": str(next(next_new_transition_id)),
                 "name": out_name,
                 "type": "DIRECTED",
                 "toStatusReference": before_ref,
