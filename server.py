@@ -1463,6 +1463,83 @@ def jira_create_sprint(
     return run_once("jira_create_sprint", idempotency_key, _create)
 
 
+@_tool(read_only=False, destructive=False, idempotent=True, open_world=True)
+@mcp_tool_handler
+def jira_update_sprint(
+    sprint_id: int,
+    name: Optional[str] = None,
+    goal: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> dict:
+    """Amend an existing sprint's name, goal, or dates without changing its state.
+
+    Calls the Jira Agile REST API POST /rest/agile/1.0/sprint/{sprintId} with a
+    partial body carrying only the supplied fields and **no** ``state`` key. That
+    omission is the whole point: ``jira_start_sprint`` sends ``{"state": "active"}``
+    alongside its date overrides, so it only applies to a sprint still in "future"
+    state and cannot amend one that is already running. This tool can, which is the
+    only way to correct a goal or move an end date on a live sprint short of closing
+    and recreating it -- which would destroy sprint history and issue associations.
+
+    Only the provided (non-None) fields are sent, so an unset field is never
+    clobbered. Re-sending the same values converges on the same end state, so a
+    retry after a lost response is safe and needs no idempotency key.
+
+    Args:
+        sprint_id: Numeric sprint ID to amend. May be in "future" or "active" state.
+        name: New sprint name. Optional.
+        goal: New sprint goal text. Optional.
+        start_date: New start date "YYYY-MM-DDTHH:MM:SS.000Z". Optional.
+        end_date: New end date "YYYY-MM-DDTHH:MM:SS.000Z". Optional.
+
+    Returns:
+        Dict with keys:
+            sprint_id (int): Echo of sprint_id.
+            sprint_name (str): Sprint display name after the update.
+            state (str): Sprint state, unchanged by this call.
+            start_date (str): Effective start date.
+            end_date (str): Effective end date.
+            goal (str): Effective sprint goal.
+            updated_fields (list[str]): The field names actually sent.
+
+    Raises:
+        ValueError: If no updatable field is supplied. Firing a no-op request
+            against the Jira API would waste a call and mask a caller bug.
+    """
+    cfg = _get_config()
+
+    body: Dict[str, Any] = {}
+    if name is not None:
+        body["name"] = name
+    if goal is not None:
+        body["goal"] = goal
+    if start_date is not None:
+        body["startDate"] = start_date
+    if end_date is not None:
+        body["endDate"] = end_date
+
+    if not body:
+        raise ValueError(
+            "jira_update_sprint requires at least one of: name, goal, "
+            "start_date, end_date. All were None."
+        )
+
+    result = _agile_request(cfg, "POST", "sprint/" + str(sprint_id), body)
+    if result is None:
+        result = {}
+
+    return {
+        "sprint_id": sprint_id,
+        "sprint_name": result.get("name", name or ""),
+        "state": result.get("state", ""),
+        "start_date": result.get("startDate", start_date or ""),
+        "end_date": result.get("endDate", end_date or ""),
+        "goal": result.get("goal", goal or ""),
+        "updated_fields": sorted(body.keys()),
+    }
+
+
 @_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jira_start_sprint(

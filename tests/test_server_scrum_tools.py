@@ -290,6 +290,105 @@ class TestJiraStartSprint:
         assert body_sent["state"] == "active"
 
 
+class TestJiraUpdateSprint:
+    """Tests for jira_update_sprint tool (issue #11)."""
+
+    @patch("urllib.request.urlopen")
+    def test_body_omits_state_so_active_sprint_is_not_transitioned(
+        self, mock_urlopen, jira_env
+    ):
+        """The POST body must carry no `state` key.
+
+        This is the whole reason the tool exists. jira_start_sprint sends
+        state=active alongside its date overrides, which is why it cannot amend
+        a sprint that is already running. If `state` ever creeps into this body,
+        the tool silently becomes a second jira_start_sprint.
+        """
+        response_data = {"id": 134, "name": "Sprint 2", "state": "active"}
+        mock_urlopen.return_value = _make_urlopen_response(response_data)
+
+        import server
+        server.jira_update_sprint(sprint_id=134, goal="Corrected goal")
+
+        req_obj = mock_urlopen.call_args[0][0]
+        body_sent = json.loads(req_obj.data.decode("utf-8"))
+        assert "state" not in body_sent
+        assert body_sent["goal"] == "Corrected goal"
+
+    @patch("urllib.request.urlopen")
+    def test_only_supplied_fields_are_sent(self, mock_urlopen, jira_env):
+        """Unset fields must not be clobbered with None."""
+        response_data = {"id": 134, "name": "Sprint 2", "state": "active"}
+        mock_urlopen.return_value = _make_urlopen_response(response_data)
+
+        import server
+        result = _parse(
+            server.jira_update_sprint(
+                sprint_id=134, end_date="2026-09-21T09:00:00.000Z"
+            )
+        )
+
+        req_obj = mock_urlopen.call_args[0][0]
+        body_sent = json.loads(req_obj.data.decode("utf-8"))
+        assert body_sent == {"endDate": "2026-09-21T09:00:00.000Z"}
+        assert "name" not in body_sent
+        assert "goal" not in body_sent
+        assert result["updated_fields"] == ["endDate"]
+
+    @patch("urllib.request.urlopen")
+    def test_all_fields_sent_together(self, mock_urlopen, jira_env):
+        """All four updatable fields map to their Jira API names."""
+        response_data = {
+            "id": 134,
+            "name": "Sprint 2 - MVP Hardening",
+            "state": "active",
+            "startDate": "2026-09-11T09:00:00.000Z",
+            "endDate": "2026-09-21T09:00:00.000Z",
+            "goal": "New goal",
+        }
+        mock_urlopen.return_value = _make_urlopen_response(response_data)
+
+        import server
+        result = _parse(
+            server.jira_update_sprint(
+                sprint_id=134,
+                name="Sprint 2 - MVP Hardening",
+                goal="New goal",
+                start_date="2026-09-11T09:00:00.000Z",
+                end_date="2026-09-21T09:00:00.000Z",
+            )
+        )
+
+        req_obj = mock_urlopen.call_args[0][0]
+        body_sent = json.loads(req_obj.data.decode("utf-8"))
+        assert sorted(body_sent.keys()) == [
+            "endDate", "goal", "name", "startDate"
+        ]
+        assert result["state"] == "active"
+        assert result["updated_fields"] == [
+            "endDate", "goal", "name", "startDate"
+        ]
+
+    @patch("urllib.request.urlopen")
+    def test_no_fields_raises_and_makes_no_request(self, mock_urlopen, jira_env):
+        """All-None must raise ValueError without firing an HTTP call."""
+        import server
+        result = _parse(server.jira_update_sprint(sprint_id=134))
+
+        assert result["success"] is False
+        mock_urlopen.assert_not_called()
+
+    def test_missing_env_returns_error_json(self, monkeypatch):
+        """Missing env vars returns success=False JSON."""
+        monkeypatch.delenv("JIRA_URL", raising=False)
+        monkeypatch.delenv("JIRA_USER", raising=False)
+        monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+
+        import server
+        result = _parse(server.jira_update_sprint(sprint_id=134, goal="x"))
+        assert result["success"] is False
+
+
 class TestJiraCloseSprint:
     """Tests for jira_close_sprint tool."""
 
