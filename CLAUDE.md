@@ -22,17 +22,19 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 
 ---
 
-## Available Tools (41 total: 10 core + 15 Scrum Master + 16 Advanced Analytics)
+## Available Tools (43 total: 12 core + 15 Scrum Master + 16 Advanced Analytics)
 
-### Core Jira Tools (10)
+### Core Jira Tools (12)
 
 - `jira_create_issue` — Create a Jira issue (project, type, summary, description, priority)
 - `jira_get_issue` — Get full issue details by key (PROJ-123)
 - `jira_search_issues` — JQL search with field projection and pagination
 - `jira_transition_issue` — Transition issue to new status (To Do/In Progress/Done)
 - `jira_add_comment` — Add a comment (auto ADF-wrapped for Cloud)
+- `jira_list_comments` — List comments on an issue (read-back counterpart to jira_add_comment)
 - `jira_link_pr` — Link a pull request URL to an issue as a remote link
 - `jira_list_projects` — List all accessible Jira projects
+- `jira_create_project` — Create a Jira project
 - `jira_get_transitions` — Get available transitions for an issue
 - `jira_update_issue` — Update issue fields (summary, description, assignee, labels)
 - `jira_health_check` — Verify Jira URL, credentials, and API version

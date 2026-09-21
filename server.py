@@ -5,12 +5,12 @@ Supports both Jira Cloud (v3, ADF format) and Jira Server/Data Center (v2, plain
 Backend: urllib.request (stdlib only, no external deps)
 Transport: stdio
 
-Tools (56):
-  Core Jira (11):
+Tools (58):
+  Core Jira (12):
     jira_create_issue, jira_get_issue, jira_search_issues,
-    jira_transition_issue, jira_add_comment, jira_link_pr,
-    jira_list_projects, jira_create_project, jira_get_transitions,
-    jira_update_issue, jira_health_check
+    jira_transition_issue, jira_add_comment, jira_list_comments,
+    jira_link_pr, jira_list_projects, jira_create_project,
+    jira_get_transitions, jira_update_issue, jira_health_check
   Scrum Master -- Board & Sprint Infrastructure (6):
     jira_get_boards, jira_get_sprints, jira_create_sprint,
     jira_start_sprint, jira_close_sprint, jira_move_issues_to_sprint
@@ -792,6 +792,74 @@ def jira_add_comment(
             + "?focusedCommentId=" + str(result.get("id", ""))
         ),
         "created": result.get("created", ""),
+    }
+
+
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
+@mcp_tool_handler
+def jira_list_comments(
+    issue_key: str,
+    start_at: int = 0,
+    max_results: int = 50,
+) -> dict:
+    """List comments on an issue.
+
+    jira_add_comment can write a comment but nothing on this server could
+    read one back -- a caller checking whether a prior comment landed, or
+    reviewing prior discussion before adding to it, had to leave the tool
+    surface entirely. jira_get_issue cannot substitute: its return dict only
+    ever extracts a fixed set of fields (summary/description/status/...) and
+    never reads a "comment" key, so passing fields="comment" just tells Jira
+    not to return the other fields, and every one of those falls back to ""/
+    {} -- the response looks blanked out, not populated with comments.
+
+    Args:
+        issue_key: Issue key (e.g. PROJ-123).
+        start_at: Zero-based offset of the first comment to return (Jira's
+            real /comment endpoint pages by offset, not a cursor -- unlike
+            jira_search_issues's /search/jql, which switched to cursor
+            pagination; see that tool's own docstring). Default: 0.
+        max_results: Maximum comments to return (default: 50, clamped to 100).
+
+    Returns:
+        Dict with issue_key, comments (list of {comment_id, author, body,
+        created, updated}, body flattened to plain text via the same ADF
+        decoder jira_get_issue uses for description), start_at, max_results,
+        total (Jira's real total comment count on the issue, for paging),
+        and count (len(comments) in this response).
+    """
+    issue_key = _safe_issue_key(issue_key)
+    cfg = _get_config()
+
+    path = (
+        "/issue/" + issue_key + "/comment"
+        + "?startAt=" + str(max(start_at, 0))
+        + "&maxResults=" + str(min(max_results, 100))
+    )
+    result = _request(cfg, "GET", path)
+
+    comments = []
+    for raw in result.get("comments", []):
+        author_raw = raw.get("author") or {}
+        comments.append({
+            "comment_id": raw.get("id"),
+            "author": (
+                author_raw.get("displayName")
+                or author_raw.get("name")
+                or ""
+            ),
+            "body": _adf_to_text(raw.get("body")),
+            "created": raw.get("created", ""),
+            "updated": raw.get("updated", ""),
+        })
+
+    return {
+        "issue_key": issue_key,
+        "comments": comments,
+        "start_at": result.get("startAt", start_at),
+        "max_results": result.get("maxResults", max_results),
+        "total": result.get("total", len(comments)),
+        "count": len(comments),
     }
 
 
