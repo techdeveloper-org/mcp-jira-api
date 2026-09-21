@@ -5,12 +5,13 @@ Supports both Jira Cloud (v3, ADF format) and Jira Server/Data Center (v2, plain
 Backend: urllib.request (stdlib only, no external deps)
 Transport: stdio
 
-Tools (58):
-  Core Jira (12):
+Tools (59):
+  Core Jira (13):
     jira_create_issue, jira_get_issue, jira_search_issues,
     jira_transition_issue, jira_add_comment, jira_list_comments,
-    jira_link_pr, jira_list_projects, jira_create_project,
-    jira_get_transitions, jira_update_issue, jira_health_check
+    jira_delete_comment, jira_link_pr, jira_list_projects,
+    jira_create_project, jira_get_transitions, jira_update_issue,
+    jira_health_check
   Scrum Master -- Board & Sprint Infrastructure (6):
     jira_get_boards, jira_get_sprints, jira_create_sprint,
     jira_start_sprint, jira_close_sprint, jira_move_issues_to_sprint
@@ -860,6 +861,37 @@ def jira_list_comments(
         "max_results": result.get("maxResults", max_results),
         "total": result.get("total", len(comments)),
         "count": len(comments),
+    }
+
+
+@_tool(read_only=False, destructive=True, idempotent=True, open_world=True)
+@mcp_tool_handler
+def jira_delete_comment(
+    issue_key: str,
+    comment_id: str,
+) -> dict:
+    """Delete a comment from a Jira issue.
+
+    Added to clean up duplicate comments produced by the gap jira_list_comments
+    fixed: before that tool existed, a caller had no way to check whether a
+    comment already existed and could post a duplicate. Jira returns 204 No
+    Content on success; _request already returns None for a 204 response, so
+    this tool does not parse a body.
+
+    Args:
+        issue_key: Issue key (e.g. PROJ-123).
+        comment_id: Comment id (as returned by jira_list_comments'
+            comment_id field, or jira_add_comment's comment_id field).
+    """
+    issue_key = _safe_issue_key(issue_key)
+    cfg = _get_config()
+
+    _request(cfg, "DELETE", "/issue/" + issue_key + "/comment/" + str(comment_id))
+
+    return {
+        "issue_key": issue_key,
+        "comment_id": comment_id,
+        "deleted": True,
     }
 
 
