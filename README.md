@@ -367,7 +367,7 @@ The `base/` directory contains the shared library used across all 13 MCP servers
 
 > **Standalone.** This server has no runtime dependency on any other project. It speaks MCP over stdio and works with any MCP client.
 
-It is also one of 13 MCP servers used by the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine), a LangGraph-based orchestration pipeline for automating end-to-end Claude Code development workflows.
+It is also one of 13 MCP servers used by the [Claude Workflow Engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine), a LangGraph-based orchestration pipeline for automating end-to-end Claude Code development workflows.
 
 | Server | Tools | Purpose |
 |--------|-------|---------|
